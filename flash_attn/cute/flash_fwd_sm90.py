@@ -57,6 +57,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mma_pv_is_rs: bool = True,
         paged_kv_non_tma: bool = False,
         ping_pong: bool = False,
+        ping_pong_sched_barrier: bool = True,
+        head_major_raster: bool = False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -78,6 +80,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # softmax/rescale, the other's wgmma keeps the tensor pipe busy
         # (FA3's ping-pong adapted to a sparse per-cube list).
         self.ping_pong = ping_pong
+        self.ping_pong_sched_barrier = ping_pong_sched_barrier
+        # Launch heads on the fastest grid dim (see SingleTileScheduler.Params.head_major).
+        self.head_major_raster = head_major_raster
         if self.ping_pong:
             assert self.intra_wg_overlap, "ping_pong assumes the intra-warpgroup overlap path"
             assert self.tile_m == 64, "ping_pong runs two independent 64-row consumer WGs"
@@ -268,11 +273,14 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             else (self.num_wg_mma == 2)
         )
         if const_expr(self.ping_pong):
-            # The two WGs process different tile counts (odd lists differ by
-            # one), so the strict sync/arrive alternation of the scheduler
-            # barrier would deadlock on the unmatched iteration. Rely on the
-            # hardware scheduler + intra-WG overlap instead.
-            self.use_scheduler_barrier = False
+            # The sync/arrive chain tolerates the odd-list imbalance without
+            # padding: WG0 (canonical warpgroup 1) always owns the ceil-half
+            # of the list AND gets the mma_init bootstrap credit, so each
+            # WG's syncs are exactly covered by the peer's arrives; at most
+            # one arrive per barrier is left un-consumed at tile end, which
+            # is harmless for the single-tile scheduler (each CTA processes
+            # exactly one work tile).
+            self.use_scheduler_barrier = self.ping_pong_sched_barrier
         self.use_tma_Q = self.arch >= Arch.sm_90 and not (
             self.pack_gqa and self.tile_m % self.qhead_per_kvhead != 0
         )
@@ -393,6 +401,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             element_size=self.dtype.width // 8,
             is_persistent=False,
             lpt=self.is_causal or self.is_local,
+            head_swizzle=self.head_major_raster,
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)

@@ -177,6 +177,11 @@ class SingleTileScheduler:
         is_split_kv: cutlass.Constexpr[bool] = False
         cluster_shape_mn: cutlass.Constexpr[Tuple[int, int]] = (1, 1)
         use_cluster_idx: cutlass.Constexpr[bool] = False
+        # Head-major rasterization: launch heads on the fastest grid dim so
+        # co-resident CTAs cover all heads of a few adjacent m_blocks instead
+        # of many m_blocks of one head (better K/V L2 reuse for block-sparse
+        # workloads where per-head selections of the same query tile overlap).
+        head_major: cutlass.Constexpr[bool] = False
 
         @staticmethod
         def create(
@@ -191,6 +196,7 @@ class SingleTileScheduler:
                 args.is_split_kv,
                 args.cluster_shape_mn,
                 args.use_cluster_idx,
+                args.head_swizzle,
             )
 
     def __init__(self, params: Params, blk_coord: cute.Coord, *, loc=None, ip=None):
@@ -238,6 +244,15 @@ class SingleTileScheduler:
             grid_x = params.num_block * params.cluster_shape_mn[0]
         else:
             grid_x = cute.round_up(params.num_block, params.cluster_shape_mn[0])
+        if const_expr(params.head_major):
+            assert params.cluster_shape_mn == (1, 1) and not params.use_cluster_idx, (
+                "head_major rasterization does not support clusters"
+            )
+            return (
+                params.num_head * params.num_splits,
+                grid_x,
+                params.num_batch,
+            )
         return (
             grid_x,
             params.num_head * params.num_splits,
@@ -245,7 +260,10 @@ class SingleTileScheduler:
         )
 
     def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
-        block_idx, head_idx, batch_idx = self._blk_coord
+        if const_expr(self.params.head_major):
+            head_idx, block_idx, batch_idx = self._blk_coord
+        else:
+            block_idx, head_idx, batch_idx = self._blk_coord
         if const_expr(self.params.is_split_kv):
             head_idx, split_idx = divmod(head_idx, self.params.num_splits_divmod)
         else:

@@ -686,6 +686,12 @@ def _flash_attn_fwd(
     # Ping-pong: two consumer warpgroups split each query tile's block list
     # (block-sparse, full lists only - VSA guarantees empty mask lists).
     sm90_ping_pong = os.environ.get("FLASH_ATTN_SM90_PP", "0") == "1"
+    # Anti-phase the two consumer WGs' MMA slots (FA3-style scheduler barrier).
+    sm90_pp_sched_barrier = os.environ.get("FLASH_ATTN_SM90_PP_SB", "1") == "1"
+    # Head-major CTA rasterization (better K/V L2 reuse for block sparsity).
+    sm90_head_major = os.environ.get("FLASH_ATTN_SM90_HEAD_MAJOR", "0") == "1"
+    if arch // 10 != 9 or causal or local or is_varlen:
+        sm90_head_major = False
     if not (
         arch // 10 == 9
         and use_block_sparsity
@@ -737,6 +743,8 @@ def _flash_attn_fwd(
         intra_wg_overlap,
         sm90_num_stages,
         sm90_ping_pong,
+        sm90_pp_sched_barrier,
+        sm90_head_major,
         use_clc_scheduler,
         qv is not None,
         gather_kv_length,
@@ -856,6 +864,8 @@ def _flash_attn_fwd(
                 q_subtile_factor=q_subtile_factor,
                 paged_kv_non_tma=page_size not in [None, tile_n],
                 ping_pong=sm90_ping_pong,
+                ping_pong_sched_barrier=sm90_pp_sched_barrier,
+                head_major_raster=sm90_head_major,
             )
         elif arch // 10 in [10, 11]:
             if qv is not None:
