@@ -82,3 +82,17 @@ so mixed use is safe):
 
 - nkv < ~1500 (≤ ~96k tokens): `MIN_BLOCKS=2` (stock kernel, 2 CTAs/SM).
 - larger: `PP=1, NUM_STAGES=4, NUM_STAGES_V=2, HEAD_MAJOR=1`.
+
+## E2E (ursa omni bench, t2v, ulysses 8, cube 64, fwd, ±5% noise floor)
+
+| size | fa4_hybrid | fa4_hybrid_v2 | v2 vs hybrid | v2 speedup vs dense |
+|---|---:|---:|---:|---:|
+| 16k  | 0.759 ms  | 0.733 ms  | 1.04x | 2.16x |
+| 32k  | 2.317 ms  | 1.905 ms  | 1.22x | 3.28x |
+| 64k  | 6.825 ms  | 6.272 ms  | 1.09x | 4.27x |
+| 128k | 25.262 ms | 24.949 ms | 1.01x | 4.51x |
+
+(The 32k e2e delta exceeds the fine-only delta; the dense baseline itself
+moved 6.73→6.25 ms between runs — the documented e2e noise. Directionally
+all four sizes improve.) Stock `fa4_hybrid` e2e matches its known-good
+latencies, confirming the shared kernel source is unbroken.
