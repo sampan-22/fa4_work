@@ -484,6 +484,80 @@ def consume_block_sparse_loads(
 
 
 @cute.jit
+def consume_block_sparse_loads_pp(
+    blocksparse_tensors: BlockSparseTensors,
+    batch_idx,
+    head_idx,
+    m_block,
+    seqlen,
+    kv_consumer_state,
+    mma_pv_fn,
+    mma_one_n_block,
+    process_first_half_block,
+    process_last_half_block,
+    mask_fn,
+    O_should_accumulate,
+    wg_idx,
+    qhead_per_kvhead: cutlass.Constexpr[int] = 1,
+    q_subtile_factor: cutlass.Constexpr[int] = 1,
+):
+    """Ping-pong consumer: two warpgroups split one query tile's FULL block
+    list by stage-sequence parity. WG w consumes list positions (in the usual
+    reverse consumption order) j = w, w+2, ... — i.e. the pipeline stages of
+    its parity — with `kv_consumer_state` already offset to the WG's first
+    stage and advanced by 2 inside the per-block helpers.
+
+    Full-block lists only: callers (VSA fine attention) guarantee
+    mask_block_cnt == 0. A nonzero mask list with ping_pong enabled leaves
+    stages unconsumed and hangs, deliberately - blocks are never silently
+    dropped.
+
+    Mirrors consume_block_sparse_loads' intra-wg-overlap path per WG:
+    first_half (QK only) -> stride-2 mma_one_n_block chain -> last_half (PV).
+
+    Returns (state, O_should_accumulate, processed_any, my_tiles, total_tiles)
+    so the caller can neutral-fill idle WGs and resync the threaded state to
+    base + total_tiles.
+    """
+    _, _, full_block_cnt, full_block_idx = blocksparse_tensors
+
+    m_block_sparse = sparse_tensor_m_block(m_block, qhead_per_kvhead, q_subtile_factor)
+    curr_full_block_cnt = full_block_cnt[batch_idx, head_idx, m_block_sparse]
+    curr_full_block_idx = full_block_idx[batch_idx, head_idx, m_block_sparse, None]
+
+    processed_any = curr_full_block_cnt > 0
+    my_tiles = (curr_full_block_cnt - wg_idx + 1) // 2
+
+    if my_tiles > 0:
+        n_block_first = curr_full_block_idx[curr_full_block_cnt - 1 - wg_idx]
+        kv_consumer_state = process_first_half_block(
+            n_block=n_block_first,
+            seqlen=seqlen,
+            kv_consumer_state=kv_consumer_state,
+            mask_fn=partial(mask_fn, mask_mod=None, mask_seqlen=True),
+            score_mod_fn=None,
+            is_first_block=True,
+        )
+        for i in cutlass.range(1, my_tiles, unroll=1):
+            n_block = curr_full_block_idx[curr_full_block_cnt - 1 - wg_idx - 2 * i]
+            kv_consumer_state = mma_one_n_block(
+                kv_consumer_state,
+                n_block=n_block,
+                seqlen=seqlen,
+                mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
+                mask_fn=partial(mask_fn, mask_mod=None, mask_seqlen=False),
+            )
+            O_should_accumulate = True
+        kv_consumer_state = process_last_half_block(
+            kv_consumer_state=kv_consumer_state,
+            zero_init=not O_should_accumulate,
+        )
+        O_should_accumulate = True
+
+    return kv_consumer_state, O_should_accumulate, processed_any, my_tiles, curr_full_block_cnt
+
+
+@cute.jit
 def load_block_list_sm100(
     block_indices: cute.Tensor,
     block_count,

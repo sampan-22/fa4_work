@@ -680,6 +680,26 @@ def _flash_attn_fwd(
         sparse_kv = None
         disable_sparse_kv_bitmask = None
 
+    # SM90 knobs (env-driven; must be in the compile key or changing the env
+    # between calls would silently hit a stale kernel).
+    sm90_num_stages = int(os.environ.get("FLASH_ATTN_SM90_NUM_STAGES", 2))
+    # Ping-pong: two consumer warpgroups split each query tile's block list
+    # (block-sparse, full lists only - VSA guarantees empty mask lists).
+    sm90_ping_pong = os.environ.get("FLASH_ATTN_SM90_PP", "0") == "1"
+    if not (
+        arch // 10 == 9
+        and use_block_sparsity
+        and not causal
+        and not local
+        and score_mod is None
+        and mask_mod is None
+        and learnable_sink is None
+        and page_table is None
+        and not pack_gqa
+        and tile_m == 64
+    ):
+        sm90_ping_pong = False
+
     compile_key = (
         dtype,
         head_dim,
@@ -715,6 +735,8 @@ def _flash_attn_fwd(
         q_subtile_factor,
         mma_pv_is_rs,
         intra_wg_overlap,
+        sm90_num_stages,
+        sm90_ping_pong,
         use_clc_scheduler,
         qv is not None,
         gather_kv_length,
@@ -823,7 +845,7 @@ def _flash_attn_fwd(
                 tile_m=tile_m,
                 tile_n=tile_n,
                 # num_stages=1,
-                num_stages=2,
+                num_stages=sm90_num_stages,
                 num_threads=num_threads,
                 Q_in_regs=False,
                 intra_wg_overlap=intra_wg_overlap,
@@ -833,6 +855,7 @@ def _flash_attn_fwd(
                 has_aux_tensors=aux_tensors is not None,
                 q_subtile_factor=q_subtile_factor,
                 paged_kv_non_tma=page_size not in [None, tile_n],
+                ping_pong=sm90_ping_pong,
             )
         elif arch // 10 in [10, 11]:
             if qv is not None:
