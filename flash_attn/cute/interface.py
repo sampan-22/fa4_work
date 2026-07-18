@@ -621,6 +621,7 @@ def _flash_attn_fwd(
     block_sparse_broadcast_pattern = None
     normalized_block_sparse_tensors = None
     q_subtile_factor = None
+    kv_pair_factor = 1
     if block_sparse_tensors is not None:
         if seqlen_q is None:
             raise ValueError("Block sparsity requires fixed-length sequences (seqlen_q must be known).")
@@ -628,6 +629,7 @@ def _flash_attn_fwd(
             normalized_block_sparse_tensors,
             block_sparse_broadcast_pattern,
             q_subtile_factor,
+            kv_pair_factor,
         ) = normalize_block_sparse_config(
             block_sparse_tensors,
             batch_size=batch_size,
@@ -636,7 +638,21 @@ def _flash_attn_fwd(
             seqlen_k=seqlen_k,
             block_size=(tile_m, tile_n),
             q_stage=q_stage,
+            # SM90 forward supports packing two sparse KV blocks per MMA tile.
+            allow_kv_pairing=arch // 10 == 9,
         )
+        if kv_pair_factor != 1:
+            # Paired path restrictions (SM90 forward, full-block list only).
+            assert not causal and not local, "KV pairing does not support causal/local masking"
+            assert score_mod is None and mask_mod is None, (
+                "KV pairing does not support score_mod/mask_mod"
+            )
+            assert learnable_sink is None, "KV pairing does not support learnable_sink"
+            assert page_table is None, "KV pairing does not support paged KV"
+            assert seqlen_k % (tile_n // kv_pair_factor) == 0, (
+                "KV pairing requires seqlen_k to be a multiple of the sparse KV block size "
+                "(every selected block must be a full block)"
+            )
     if aux_tensors is not None:
         aux_tensor_metadata = get_aux_tensor_metadata(aux_tensors)
     else:
@@ -713,6 +729,7 @@ def _flash_attn_fwd(
         page_size not in [None, tile_n],  # paged KV non-TMA
         use_2cta_instrs,
         q_subtile_factor,
+        kv_pair_factor,
         mma_pv_is_rs,
         intra_wg_overlap,
         use_clc_scheduler,
@@ -833,6 +850,7 @@ def _flash_attn_fwd(
                 has_aux_tensors=aux_tensors is not None,
                 q_subtile_factor=q_subtile_factor,
                 paged_kv_non_tma=page_size not in [None, tile_n],
+                kv_pair_factor=kv_pair_factor,
             )
         elif arch // 10 in [10, 11]:
             if qv is not None:
