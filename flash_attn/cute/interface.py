@@ -840,7 +840,9 @@ def _flash_attn_fwd(
                 tile_m=tile_m,
                 tile_n=tile_n,
                 # num_stages=1,
-                num_stages=2,
+                # 2 stages also for the paired path (tile_n=128 stages): a 3rd
+                # stage fits smem for hdim 128 but measured no faster.
+                num_stages=int(os.environ.get("FLASH_ATTN_SM90_NUM_STAGES", 2)),
                 num_threads=num_threads,
                 Q_in_regs=False,
                 intra_wg_overlap=intra_wg_overlap,
