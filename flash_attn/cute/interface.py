@@ -696,6 +696,15 @@ def _flash_attn_fwd(
         sparse_kv = None
         disable_sparse_kv_bitmask = None
 
+    # SM90 pipeline staging / occupancy knobs (env-driven; must be part of the
+    # compile key or changing the env between calls would hit a stale kernel).
+    sm90_num_stages = int(os.environ.get("FLASH_ATTN_SM90_NUM_STAGES", 2))
+    sm90_num_stages_v = int(os.environ.get("FLASH_ATTN_SM90_NUM_STAGES_V", sm90_num_stages))
+    sm90_min_blocks = int(os.environ.get("FLASH_ATTN_SM90_MIN_BLOCKS", 1))
+    if kv_pair_factor != 2:
+        # Asymmetric V staging is only wired up for the paired path.
+        sm90_num_stages_v = sm90_num_stages
+
     compile_key = (
         dtype,
         head_dim,
@@ -730,6 +739,9 @@ def _flash_attn_fwd(
         use_2cta_instrs,
         q_subtile_factor,
         kv_pair_factor,
+        sm90_num_stages,
+        sm90_num_stages_v,
+        sm90_min_blocks,
         mma_pv_is_rs,
         intra_wg_overlap,
         use_clc_scheduler,
@@ -842,7 +854,7 @@ def _flash_attn_fwd(
                 # num_stages=1,
                 # 2 stages also for the paired path (tile_n=128 stages): a 3rd
                 # stage fits smem for hdim 128 but measured no faster.
-                num_stages=int(os.environ.get("FLASH_ATTN_SM90_NUM_STAGES", 2)),
+                num_stages=sm90_num_stages,
                 num_threads=num_threads,
                 Q_in_regs=False,
                 intra_wg_overlap=intra_wg_overlap,
@@ -853,6 +865,8 @@ def _flash_attn_fwd(
                 q_subtile_factor=q_subtile_factor,
                 paged_kv_non_tma=page_size not in [None, tile_n],
                 kv_pair_factor=kv_pair_factor,
+                num_stages_v=sm90_num_stages_v,
+                min_blocks_per_mp=sm90_min_blocks,
             )
         elif arch // 10 in [10, 11]:
             if qv is not None:

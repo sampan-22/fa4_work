@@ -542,6 +542,7 @@ def load_paired_block_list(
     pipeline_k,
     pipeline_v,
     intra_wg_overlap: cutlass.Constexpr,
+    v_state_view=None,
 ):
     """Load two sparse blocks per pipeline stage (paired-load variant of
     load_block_list, including the trailing overlapped V load).
@@ -550,7 +551,11 @@ def load_paired_block_list(
     last pair duplicates entry block_count - 1 into both halves. Pairs are
     iterated in reverse to mirror load_block_list, so the (possibly
     duplicated) tail pair is produced - and consumed - first.
+
+    v_state_view re-interprets the K-threaded producer state for the V
+    pipeline when V has a different stage count (identity when None).
     """
+    v_state_view = v_state_view if const_expr(v_state_view is not None) else (lambda s: s)
     if block_count > 0:
         num_pairs = (block_count + 1) // 2
         last = block_count - 1
@@ -561,8 +566,9 @@ def load_paired_block_list(
                 n_block_b = block_indices[cutlass.min(2 * p + 1, last)]
                 pipeline_k.producer_acquire(kv_producer_state)
                 load_K_pair(n_block_a, n_block_b, kv_producer_state)
-                pipeline_v.producer_acquire(kv_producer_state)
-                load_V_pair(n_block_a, n_block_b, kv_producer_state)
+                kv_producer_state_v = v_state_view(kv_producer_state)
+                pipeline_v.producer_acquire(kv_producer_state_v)
+                load_V_pair(n_block_a, n_block_b, kv_producer_state_v)
                 kv_producer_state.advance()
         else:
             n_block_a = block_indices[2 * (num_pairs - 1)]
@@ -581,13 +587,15 @@ def load_paired_block_list(
                 kv_producer_state.advance()
                 pipeline_k.producer_acquire(kv_producer_state)
                 load_K_pair(a_cur, b_cur, kv_producer_state)
-                pipeline_v.producer_acquire(kv_producer_state_prev)
-                load_V_pair(a_prev, b_prev, kv_producer_state_prev)
+                kv_producer_state_prev_v = v_state_view(kv_producer_state_prev)
+                pipeline_v.producer_acquire(kv_producer_state_prev_v)
+                load_V_pair(a_prev, b_prev, kv_producer_state_prev_v)
             # Drain the final pending V (pair 0, or the only pair).
             a0 = block_indices[0]
             b0 = block_indices[cutlass.min(1, last)]
-            pipeline_v.producer_acquire(kv_producer_state)
-            load_V_pair(a0, b0, kv_producer_state)
+            kv_producer_state_v = v_state_view(kv_producer_state)
+            pipeline_v.producer_acquire(kv_producer_state_v)
+            load_V_pair(a0, b0, kv_producer_state_v)
             kv_producer_state.advance()
 
     return kv_producer_state
@@ -607,6 +615,7 @@ def produce_block_sparse_paired_loads(
     intra_wg_overlap: cutlass.Constexpr,
     qhead_per_kvhead: cutlass.Constexpr[int] = 1,
     q_subtile_factor: cutlass.Constexpr[int] = 1,
+    v_state_view=None,
 ):
     """Paired-load variant of produce_block_sparse_loads (full list only)."""
     _, _, full_block_cnt, full_block_idx = blocksparse_tensors
@@ -624,6 +633,7 @@ def produce_block_sparse_paired_loads(
         pipeline_k,
         pipeline_v,
         intra_wg_overlap,
+        v_state_view=v_state_view,
     )
     return kv_producer_state
 

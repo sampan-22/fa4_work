@@ -10,6 +10,9 @@ class NamedBarrierFwd(enum.IntEnum):
     WarpSchedulerWG3 = enum.auto()
     PFull = enum.auto()
     PEmpty = enum.auto()
+    # Ping-pong paired path: consumer WG1 hands its partial (acc_O, row stats)
+    # to WG0 for the SplitKV-style merge before the epilogue.
+    PingPongMerge = enum.auto()
 
 
 class NamedBarrierFwdSm100(enum.IntEnum):
