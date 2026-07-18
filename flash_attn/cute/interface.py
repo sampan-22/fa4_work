@@ -696,6 +696,10 @@ def _flash_attn_fwd(
     sm90_num_stages_v = int(os.environ.get("FLASH_ATTN_SM90_NUM_STAGES_V", sm90_num_stages))
     if not sm90_ping_pong:
         sm90_num_stages_v = sm90_num_stages
+    # 2 CTAs/SM occupancy config (256-thread kernel only; exclusive with pp).
+    sm90_min_blocks = int(os.environ.get("FLASH_ATTN_SM90_MIN_BLOCKS", 1))
+    if sm90_ping_pong or arch // 10 != 9:
+        sm90_min_blocks = 1
     if not (
         arch // 10 == 9
         and use_block_sparsity
@@ -750,6 +754,7 @@ def _flash_attn_fwd(
         sm90_ping_pong,
         sm90_pp_sched_barrier,
         sm90_head_major,
+        sm90_min_blocks,
         use_clc_scheduler,
         qv is not None,
         gather_kv_length,
@@ -872,6 +877,7 @@ def _flash_attn_fwd(
                 ping_pong_sched_barrier=sm90_pp_sched_barrier,
                 head_major_raster=sm90_head_major,
                 num_stages_v=sm90_num_stages_v,
+                min_blocks_per_mp=sm90_min_blocks,
             )
         elif arch // 10 in [10, 11]:
             if qv is not None:

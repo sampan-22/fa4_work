@@ -60,6 +60,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         ping_pong_sched_barrier: bool = True,
         head_major_raster: bool = False,
         num_stages_v: Optional[int] = None,
+        min_blocks_per_mp: int = 1,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -84,6 +85,15 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self.ping_pong_sched_barrier = ping_pong_sched_barrier
         # Launch heads on the fastest grid dim (see SingleTileScheduler.Params.head_major).
         self.head_major_raster = head_major_raster
+        # minnctapersm launch bound. 2 asks ptxas to cap the launch REGCOUNT
+        # at 128 so two 256-thread CTAs co-reside per SM (the default
+        # REGCOUNT of 255 occupies the whole register file, limiting to
+        # 1 CTA/SM regardless of smem). The setmaxnreg targets are adjusted
+        # in __call__ to fit the per-CTA pool of 128 x 256 registers.
+        self.min_blocks_per_mp = min_blocks_per_mp
+        assert self.min_blocks_per_mp in [1, 2]
+        if self.min_blocks_per_mp == 2:
+            assert not ping_pong, "2 CTAs/SM (256 threads) and ping-pong (384) are exclusive"
         # Asymmetric K/V staging: V may run with fewer pipeline stages than K.
         # V stages hold the OLDEST in-flight positions (V is released last),
         # so narrowing V shrinks each CTA's in-flight position front - the
@@ -280,6 +290,13 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self.num_mma_regs, self.num_producer_regs = {1: (256, 56), 2: (240, 24), 3: (160, 32)}[
             self.num_wg_mma
         ]
+        if const_expr(self.min_blocks_per_mp == 2):
+            assert self.num_wg_mma == 1, "2 CTAs/SM only sized for one consumer warpgroup"
+            # Launch REGCOUNT is capped at 128 by minnctapersm=2; the per-CTA
+            # redistribution pool is 256 threads x 128 regs. Producer dec to
+            # 24 frees exactly the 104 regs/thread the consumer WG needs to
+            # inc from 128 to 232.
+            self.num_mma_regs, self.num_producer_regs = 232, 24
         self.use_block_sparsity = cutlass.const_expr(blocksparse_tensors is not None)
         if const_expr(self.ping_pong):
             assert self.use_block_sparsity, "ping_pong requires block sparsity"
@@ -473,7 +490,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
             stream=stream,
-            min_blocks_per_mp=1,
+            min_blocks_per_mp=self.min_blocks_per_mp,
         )
 
     @cute.kernel
