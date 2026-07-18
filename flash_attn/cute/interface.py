@@ -692,6 +692,10 @@ def _flash_attn_fwd(
     sm90_head_major = os.environ.get("FLASH_ATTN_SM90_HEAD_MAJOR", "0") == "1"
     if arch // 10 != 9 or causal or local or is_varlen:
         sm90_head_major = False
+    # Asymmetric K/V staging (V narrower); only wired up for ping-pong.
+    sm90_num_stages_v = int(os.environ.get("FLASH_ATTN_SM90_NUM_STAGES_V", sm90_num_stages))
+    if not sm90_ping_pong:
+        sm90_num_stages_v = sm90_num_stages
     if not (
         arch // 10 == 9
         and use_block_sparsity
@@ -742,6 +746,7 @@ def _flash_attn_fwd(
         mma_pv_is_rs,
         intra_wg_overlap,
         sm90_num_stages,
+        sm90_num_stages_v,
         sm90_ping_pong,
         sm90_pp_sched_barrier,
         sm90_head_major,
@@ -866,6 +871,7 @@ def _flash_attn_fwd(
                 ping_pong=sm90_ping_pong,
                 ping_pong_sched_barrier=sm90_pp_sched_barrier,
                 head_major_raster=sm90_head_major,
+                num_stages_v=sm90_num_stages_v,
             )
         elif arch // 10 in [10, 11]:
             if qv is not None:

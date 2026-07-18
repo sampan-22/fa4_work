@@ -59,6 +59,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         ping_pong: bool = False,
         ping_pong_sched_barrier: bool = True,
         head_major_raster: bool = False,
+        num_stages_v: Optional[int] = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -83,6 +84,23 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self.ping_pong_sched_barrier = ping_pong_sched_barrier
         # Launch heads on the fastest grid dim (see SingleTileScheduler.Params.head_major).
         self.head_major_raster = head_major_raster
+        # Asymmetric K/V staging: V may run with fewer pipeline stages than K.
+        # V stages hold the OLDEST in-flight positions (V is released last),
+        # so narrowing V shrinks each CTA's in-flight position front - the
+        # quantity that pushes the co-resident CTAs' combined K/V working set
+        # past L2 capacity at large sizes.
+        self.num_stages_v = num_stages_v if num_stages_v is not None else self.num_stages
+        if self.num_stages_v != self.num_stages:
+            assert self.ping_pong, "asymmetric V staging is only wired up for the ping-pong path"
+            assert 1 <= self.num_stages_v <= self.num_stages
+        if self.ping_pong:
+            # Odd stage counts interleave a stage index's refills between the
+            # two consumer WGs; a reproducible Xid-43 fault at num_stages=3
+            # (even though memcheck/racecheck/synccheck come back clean) makes
+            # even counts a hard requirement until that is understood.
+            assert self.num_stages % 2 == 0 and self.num_stages_v % 2 == 0, (
+                "ping_pong requires even K/V stage counts (stage parity == WG ownership)"
+            )
         if self.ping_pong:
             assert self.intra_wg_overlap, "ping_pong assumes the intra-warpgroup overlap path"
             assert self.tile_m == 64, "ping_pong runs two independent 64-row consumer WGs"
@@ -166,7 +184,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # 1 stage * 2 for Q pipeline (full + empty), self.num_stages*2 for K, self.num_stages*2 for V,
         mbar_ptr_Q_struct = cute.struct.MemRange[cutlass.Int64, 1 * 2]
         mbar_ptr_K_struct = cute.struct.MemRange[cutlass.Int64, self.num_stages * 2]
-        mbar_ptr_V_struct = cute.struct.MemRange[cutlass.Int64, self.num_stages * 2]
+        mbar_ptr_V_struct = cute.struct.MemRange[cutlass.Int64, self.num_stages_v * 2]
 
         @cute.struct
         class SharedStorageQKV:
@@ -296,7 +314,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             for mX, shape, stage in [
                 (mQ, (self.tile_m, self.tile_hdim), None),
                 (mK, (self.tile_n, self.tile_hdim), self.num_stages),
-                (mV, (self.tile_n, self.tile_hdimv), self.num_stages),
+                (mV, (self.tile_n, self.tile_hdimv), self.num_stages_v),
                 (mO, (self.tile_m, self.tile_hdimv), None),
             ]
         ]
@@ -555,7 +573,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             )
             pipeline_v = pipeline_custom.PipelineTmaAsync.create(
                 barrier_storage=storage.mbar_ptr_V.data_ptr(),
-                num_stages=self.num_stages,
+                num_stages=self.num_stages_v,
                 producer_group=tma_warp,
                 consumer_group=kv_release_warps,
                 tx_count=self.tma_copy_bytes["V"],
@@ -979,6 +997,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                             self.intra_wg_overlap,
                             self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
                             self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                            v_state_view=partial(self.v_state_view, producer=True),
                         )
 
                 tile_scheduler.prefetch_next_work()
@@ -990,7 +1009,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             # We only need producer_tail on V since that's the last that's loaded, we don't
             # need it for Q (no cluster) and K.
             if is_kv_load_warp:
-                pipeline_v.producer_tail(kv_producer_state)
+                pipeline_v.producer_tail(self.v_state_view(kv_producer_state, producer=True))
 
     def _pp_state_at(self, count):
         """Consumer PipelineState positioned at absolute stage-sequence number
@@ -998,6 +1017,29 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         start at phase 0). Plain Python trace-time helper on purpose."""
         ns = self.num_stages
         return pipeline.PipelineState(ns, count, count % ns, (count // ns) % 2)
+
+    def v_state_view(self, state, producer: bool = False):
+        """Re-interpret a K-threaded pipeline state for the V pipeline when V
+        has a different (smaller) stage count.
+
+        PipelineState.count is the monotonic stage-sequence number, identical
+        for K and V; only the (index, phase) decomposition depends on the
+        stage count: index = count % stages, phase = phase0 ^ ((count //
+        stages) % 2), with phase0 = 1 for producers (empty buffer, flipped
+        phase) and 0 for consumers. Identity when the counts match. Plain
+        Python trace-time helper on purpose.
+        """
+        if self.num_stages_v == self.num_stages:
+            return state
+        phase0 = 1 if producer else 0
+        count = state.count
+        if self.num_stages_v == 1:
+            index = Int32(0)
+            phase = phase0 ^ (count % 2)
+        else:
+            index = count % self.num_stages_v
+            phase = phase0 ^ ((count // self.num_stages_v) % 2)
+        return pipeline.PipelineState(self.num_stages_v, count, index, phase)
 
     @cute.jit
     def pp_merge(
@@ -1570,9 +1612,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         if const_expr(self.rescale_O_before_gemm):
             softmax.rescale_O(acc_O, scores_scale)
 
-        pipeline_v.consumer_wait(kv_consumer_state, pipeline_v.consumer_try_wait(kv_consumer_state))
-        mma_pv_fn(B_idx=kv_consumer_state.index, zero_init=zero_init, wg_wait=0)
-        pipeline_v.consumer_release(kv_consumer_state)
+        kv_consumer_state_v = self.v_state_view(kv_consumer_state)
+        pipeline_v.consumer_wait(
+            kv_consumer_state_v, pipeline_v.consumer_try_wait(kv_consumer_state_v)
+        )
+        mma_pv_fn(B_idx=kv_consumer_state_v.index, zero_init=zero_init, wg_wait=0)
+        pipeline_v.consumer_release(kv_consumer_state_v)
         kv_consumer_state.advance()
         if const_expr(self.ping_pong):
             kv_consumer_state.advance()
@@ -1632,11 +1677,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             # Fence and barrier to make sure smem store is visible to WGMMA
             cute.arch.fence_view_async_shared()
             cute.arch.sync_warp()  # Only need syncwarp since each warp is using its own P values for MmaPV
-        pipeline_v.consumer_wait(smem_pipe_read, pipeline_v.consumer_try_wait(smem_pipe_read))
+        smem_pipe_read_v = self.v_state_view(smem_pipe_read)
+        pipeline_v.consumer_wait(smem_pipe_read_v, pipeline_v.consumer_try_wait(smem_pipe_read_v))
         self.warp_scheduler_barrier_sync()
         # O += P @ V
-        mma_pv_fn(B_idx=smem_pipe_read.index, wg_wait=0)
-        pipeline_v.consumer_release(smem_pipe_read)
+        mma_pv_fn(B_idx=smem_pipe_read_v.index, wg_wait=0)
+        pipeline_v.consumer_release(smem_pipe_read_v)
         smem_pipe_read.advance()
         return smem_pipe_read
 
@@ -1659,7 +1705,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mask_fn: Optional[Callable] = None,
         check_inf: cutlass.Constexpr = True,
     ):
-        smem_pipe_read_v = smem_pipe_read.clone()
+        smem_pipe_read_v = self.v_state_view(smem_pipe_read.clone())
         smem_pipe_read.advance()
         if const_expr(self.ping_pong):
             # Stride-2 stage consumption: this WG's next K sits two stages

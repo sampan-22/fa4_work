@@ -79,6 +79,7 @@ def load_block_list(
     pipeline_k,
     pipeline_v,
     intra_wg_overlap: cutlass.Constexpr,
+    v_state_view=None,
 ):
     """Iterate over the sparse blocks and load K, V into the pipeline.
     For the intra_wg_overlap case, we overlap the loads of K and V. And this
@@ -88,6 +89,9 @@ def load_block_list(
 
     Q is loaded separately on its own mbarrier before this function is called.
 
+    v_state_view re-interprets the K-threaded producer state for the V
+    pipeline when V has a different stage count (identity when None).
+
     Note:
         we iterate along the block_n indices in reverse.
 
@@ -95,14 +99,16 @@ def load_block_list(
         Updated kv_producer_state after processing the block list.
 
     """
+    v_state_view = v_state_view if const_expr(v_state_view is not None) else (lambda s: s)
     if block_count > 0:
         if const_expr(not intra_wg_overlap):
             for offset in cutlass.range(block_count):
                 n_block = block_indices[block_count - 1 - offset]
                 pipeline_k.producer_acquire(kv_producer_state)
                 load_K(src_idx=n_block, producer_state=kv_producer_state)
-                pipeline_v.producer_acquire(kv_producer_state)
-                load_V(src_idx=n_block, producer_state=kv_producer_state)
+                kv_producer_state_v = v_state_view(kv_producer_state)
+                pipeline_v.producer_acquire(kv_producer_state_v)
+                load_V(src_idx=n_block, producer_state=kv_producer_state_v)
                 kv_producer_state.advance()
         else:
             n_block_first = block_indices[block_count - 1]
@@ -117,8 +123,9 @@ def load_block_list(
                 kv_producer_state.advance()
                 pipeline_k.producer_acquire(kv_producer_state)
                 load_K(src_idx=n_block, producer_state=kv_producer_state)
-                pipeline_v.producer_acquire(kv_producer_state_prev)
-                load_V(src_idx=n_block_prev, producer_state=kv_producer_state_prev)
+                kv_producer_state_prev_v = v_state_view(kv_producer_state_prev)
+                pipeline_v.producer_acquire(kv_producer_state_prev_v)
+                load_V(src_idx=n_block_prev, producer_state=kv_producer_state_prev_v)
 
     return kv_producer_state
 
@@ -130,12 +137,15 @@ def finish_overlap_v_load(
     load_V,
     pipeline_v,
     kv_producer_state,
+    v_state_view=None,
 ):
     """Load the final V block after overlapped K/V loads."""
+    v_state_view = v_state_view if const_expr(v_state_view is not None) else (lambda s: s)
     if block_count > 0:
         n_block_last = block_indices[0]
-        pipeline_v.producer_acquire(kv_producer_state)
-        load_V(src_idx=n_block_last, producer_state=kv_producer_state)
+        kv_producer_state_v = v_state_view(kv_producer_state)
+        pipeline_v.producer_acquire(kv_producer_state_v)
+        load_V(src_idx=n_block_last, producer_state=kv_producer_state_v)
         kv_producer_state.advance()
 
     return kv_producer_state
@@ -170,6 +180,7 @@ def produce_block_sparse_loads(
     intra_wg_overlap: cutlass.Constexpr,
     qhead_per_kvhead: cutlass.Constexpr[int] = 1,
     q_subtile_factor: cutlass.Constexpr[int] = 1,
+    v_state_view=None,
 ):
     """Iterate over the mask and full block lists for a single tile.
 
@@ -217,6 +228,7 @@ def produce_block_sparse_loads(
             pipeline_k=pipeline_k,
             pipeline_v=pipeline_v,
             intra_wg_overlap=intra_wg_overlap,
+            v_state_view=v_state_view,
         )
 
         if const_expr(intra_wg_overlap) and curr_full_block_cnt > 0:
@@ -226,6 +238,7 @@ def produce_block_sparse_loads(
                 load_V,
                 pipeline_v,
                 kv_producer_state,
+                v_state_view=v_state_view,
             )
     else:
         # Masked blocks present. When overlap is disabled this fully drains the list.
@@ -239,6 +252,7 @@ def produce_block_sparse_loads(
             pipeline_k=pipeline_k,
             pipeline_v=pipeline_v,
             intra_wg_overlap=intra_wg_overlap,
+            v_state_view=v_state_view,
         )
 
         if full_empty:
@@ -249,19 +263,22 @@ def produce_block_sparse_loads(
                     load_V,
                     pipeline_v,
                     kv_producer_state,
+                    v_state_view=v_state_view,
                 )
         else:
             if const_expr(intra_wg_overlap):
                 # Bridge the masked list to the full list by overlapping the pending masked V
                 # with the first full K load.
+                _v_view = v_state_view if const_expr(v_state_view is not None) else (lambda s: s)
                 n_block_mask_last = curr_mask_block_idx[0]
                 n_block_full_first = curr_full_block_idx[curr_full_block_cnt - 1]
                 kv_producer_state_prev = kv_producer_state.clone()
                 kv_producer_state.advance()
                 pipeline_k.producer_acquire(kv_producer_state)
                 load_K(src_idx=n_block_full_first, producer_state=kv_producer_state)
-                pipeline_v.producer_acquire(kv_producer_state_prev)
-                load_V(src_idx=n_block_mask_last, producer_state=kv_producer_state_prev)
+                kv_producer_state_prev_v = _v_view(kv_producer_state_prev)
+                pipeline_v.producer_acquire(kv_producer_state_prev_v)
+                load_V(src_idx=n_block_mask_last, producer_state=kv_producer_state_prev_v)
 
                 kv_producer_state = load_block_list(
                     curr_full_block_idx,
@@ -273,6 +290,7 @@ def produce_block_sparse_loads(
                     pipeline_k=pipeline_k,
                     pipeline_v=pipeline_v,
                     intra_wg_overlap=intra_wg_overlap,
+                    v_state_view=v_state_view,
                 )
 
                 kv_producer_state = finish_overlap_v_load(
@@ -281,6 +299,7 @@ def produce_block_sparse_loads(
                     load_V,
                     pipeline_v,
                     kv_producer_state,
+                    v_state_view=v_state_view,
                 )
             else:
                 # Non-overlap path with both lists: run the full list normally.
@@ -294,6 +313,7 @@ def produce_block_sparse_loads(
                     pipeline_k=pipeline_k,
                     pipeline_v=pipeline_v,
                     intra_wg_overlap=intra_wg_overlap,
+                    v_state_view=v_state_view,
                 )
 
     return kv_producer_state
