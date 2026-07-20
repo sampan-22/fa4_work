@@ -1,11 +1,14 @@
-"""Fine-attention-only latency: paired (tile_mn=(64,128)) vs unpaired (64,64).
-
-Uses the exact VSA bench fine-stage shapes (per-GPU after ulysses 8):
+"""Fine-attention-only latency: stock (1 CTA/SM) vs 2-CTA/SM
+(FLASH_ATTN_SM90_MIN_BLOCKS=2) on the SM90 forward, block-sparse VSA
+shapes. Exact VSA bench fine-stage shapes (per-GPU after ulysses 8):
 B=1, D=128, Hq=8, Hkv=1, num_blocks cubes of 64 tokens, topk selected per
-query cube. Reports latency, TFLOP/s and MFU with the session FLOP formula
-4 * 64^2 * D * num_blocks * topk * heads (identical for both kernels).
+query cube. FLOPs = 4 * 64^2 * D * num_blocks * topk * heads.
+
+Usage: python bench_min_blocks.py [sizes]
+  sizes: comma list from {16k,32k,64k,128k} (default all)
 """
 
+import os
 import sys
 import torch
 
@@ -49,15 +52,16 @@ def make_inputs(nkv, topk, seed=0):
     return q, k, v, bs
 
 
-def time_kernel(q, k, v, bs, tile_mn, warmup=10, rep=50):
+def time_kernel(q, k, v, bs, min_blocks, warmup=10, rep=50):
+    os.environ["FLASH_ATTN_SM90_MIN_BLOCKS"] = str(min_blocks)
     for _ in range(warmup):
-        _flash_attn_fwd(q, k, v, block_sparse_tensors=bs, tile_mn=tile_mn)
+        _flash_attn_fwd(q, k, v, block_sparse_tensors=bs, tile_mn=(64, 64))
     torch.cuda.synchronize()
     t0 = torch.cuda.Event(enable_timing=True)
     t1 = torch.cuda.Event(enable_timing=True)
     t0.record()
     for _ in range(rep):
-        _flash_attn_fwd(q, k, v, block_sparse_tensors=bs, tile_mn=tile_mn)
+        _flash_attn_fwd(q, k, v, block_sparse_tensors=bs, tile_mn=(64, 64))
     t1.record()
     torch.cuda.synchronize()
     return t0.elapsed_time(t1) / rep
@@ -65,15 +69,15 @@ def time_kernel(q, k, v, bs, tile_mn, warmup=10, rep=50):
 
 def main():
     sizes = sys.argv[1].split(",") if len(sys.argv) > 1 else list(SIZES)
-    print(f"{'size':>6} {'kernel':>10} {'ms':>9} {'TFLOP/s':>9} {'MFU':>7}")
+    print(f"{'size':>6} {'cfg':>8} {'ms':>9} {'TFLOP/s':>9} {'MFU':>7}")
     for name in sizes:
         nkv, topk = SIZES[name]
         q, k, v, bs = make_inputs(nkv, topk)
         flops = 4 * BLK * BLK * 128 * nkv * topk * 8
-        for label, tile_mn in [("unpaired", (64, 64)), ("paired", (64, 128))]:
-            ms = time_kernel(q, k, v, bs, tile_mn)
+        for label, min_blocks in [("1cta", 1), ("2cta", 2)]:
+            ms = time_kernel(q, k, v, bs, min_blocks)
             tf = flops / (ms * 1e-3) / 1e12
-            print(f"{name:>6} {label:>10} {ms:9.3f} {tf:9.1f} {tf / (PEAK / 1e12) * 100:6.1f}%")
+            print(f"{name:>6} {label:>8} {ms:9.3f} {tf:9.1f} {tf / (PEAK / 1e12) * 100:6.1f}%")
 
 
 if __name__ == "__main__":

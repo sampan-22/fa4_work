@@ -110,6 +110,13 @@ but the code path was judged not worth keeping (issue-slot contention
 between the two warpgroups capped delivered MFU well below the tensor
 pipe's measured occupancy, and the implementation complexity/fragility
 — e.g. an unexplained Xid-43 fault at odd pipeline-stage counts — wasn't
-worth the ~1pp it bought at 128k). The current 128k direction is
-KV-pairing (`kv_pair_factor=2`, see the repo's kv-pairing docs/history)
-instead.
+worth the ~1pp it bought at 128k).
+
+KV-pairing (`kv_pair_factor=2`, packing two selected 64-token cubes into
+one 128-wide MMA tile) was also tried at one point but is not part of
+this line of work either — the target here is specifically the 2-CTA/SM
+occupancy win at 16k-64k (§4), kept as small and isolated a change as
+possible (`min_blocks_per_mp` + register-table override only; no
+pairing, no ping-pong, no asymmetric K/V staging, no rasterization
+changes). 128k is intentionally left at the stock 43.1% baseline for
+now — see §4 for why forcing 2 CTAs/SM there is the wrong vehicle.

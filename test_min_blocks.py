@@ -1,14 +1,14 @@
-"""Correctness harness for the SM90 KV-pairing path (kv_pair_factor=2).
+"""Correctness harness for the SM90 2-CTA/SM occupancy config
+(FLASH_ATTN_SM90_MIN_BLOCKS=2): forces the launch REGCOUNT down to 128
+(minnctapersm=2) so two 256-thread CTAs co-reside per SM, instead of the
+default 1 (REGCOUNT=255 occupies the whole register file). Purely an
+occupancy/register-budget change; the kernel logic is untouched.
 
-Compares _flash_attn_fwd with tile_mn=(64,128) + sparse block_size=(64,64)
-(the paired path) against:
-  1. the unpaired path (tile_mn=(64,64), same sparse tensors), and
-  2. an fp32 torch reference over the selected cubes.
-
-Covers even topk, odd topk (duplicate-tail masking), topk=1, GQA (Hq=8,
-Hkv=1, mirroring the VSA bench shapes) and MHA.
+Compares the stock (MIN_BLOCKS=1) vs 2-CTA (MIN_BLOCKS=2) configs against
+an fp32 torch reference over the selected cubes, on identical inputs.
 """
 
+import os
 import torch
 
 from flash_attn.cute.interface import _flash_attn_fwd
@@ -18,7 +18,6 @@ BLK = 64
 
 
 def make_sparse(sel, nkv):
-    """sel: (B, H, nq, topk) sorted int32 cube indices -> BlockSparseTensorsTorch."""
     B, H, nq, topk = sel.shape
     dev = sel.device
     full_block_idx = torch.zeros((B, H, nq, nkv), dtype=torch.int32, device=dev)
@@ -57,6 +56,12 @@ def ref_attention(q, k, v, sel):
     return out
 
 
+def run_kernel(q, k, v, bs, min_blocks):
+    os.environ["FLASH_ATTN_SM90_MIN_BLOCKS"] = str(min_blocks)
+    out, _ = _flash_attn_fwd(q, k, v, block_sparse_tensors=bs, tile_mn=(64, 64))
+    return out
+
+
 def run_case(B, H, Hkv, nq, nkv, topk, seed):
     torch.manual_seed(seed)
     dev = "cuda"
@@ -64,7 +69,6 @@ def run_case(B, H, Hkv, nq, nkv, topk, seed):
     q = torch.randn(B, nq * BLK, H, D, dtype=torch.bfloat16, device=dev)
     k = torch.randn(B, nkv * BLK, Hkv, D, dtype=torch.bfloat16, device=dev)
     v = torch.randn(B, nkv * BLK, Hkv, D, dtype=torch.bfloat16, device=dev)
-    # random distinct cube selections per (b, h, qcube), sorted like fa4_hybrid
     sel = torch.stack(
         [
             torch.sort(torch.randperm(nkv, device=dev)[:topk]).values
@@ -73,20 +77,18 @@ def run_case(B, H, Hkv, nq, nkv, topk, seed):
     ).view(B, H, nq, topk).to(torch.int32)
 
     bs = make_sparse(sel, nkv)
-    out_unpaired, _ = _flash_attn_fwd(q, k, v, block_sparse_tensors=bs, tile_mn=(64, 64))
-    out_paired, _ = _flash_attn_fwd(q, k, v, block_sparse_tensors=bs, tile_mn=(64, 128))
+    out_1cta = run_kernel(q, k, v, bs, min_blocks=1)
+    out_2cta = run_kernel(q, k, v, bs, min_blocks=2)
     ref = ref_attention(q, k, v, sel)
 
-    err_unpaired = (out_unpaired.float() - ref).abs().max().item()
-    err_paired = (out_paired.float() - ref).abs().max().item()
-    err_cross = (out_paired.float() - out_unpaired.float()).abs().max().item()
+    err_1cta = (out_1cta.float() - ref).abs().max().item()
+    err_2cta = (out_2cta.float() - ref).abs().max().item()
+    err_cross = (out_2cta.float() - out_1cta.float()).abs().max().item()
     tag = f"B={B} H={H} Hkv={Hkv} nq={nq} nkv={nkv} topk={topk}"
-    # bf16 tolerance: paired must be as accurate as unpaired (same math,
-    # different tiling); both are compared to the fp32 reference.
-    ok = err_paired < max(2.5 * err_unpaired, 1e-2) and err_paired < 0.1
+    ok = err_2cta < max(2.0 * err_1cta, 1e-2) and err_2cta < 0.1
     print(
-        f"{'PASS' if ok else 'FAIL'} {tag}: max|paired-ref|={err_paired:.3e} "
-        f"max|unpaired-ref|={err_unpaired:.3e} max|paired-unpaired|={err_cross:.3e}"
+        f"{'PASS' if ok else 'FAIL'} {tag}: max|2cta-ref|={err_2cta:.3e} "
+        f"max|1cta-ref|={err_1cta:.3e} max|2cta-1cta|={err_cross:.3e}"
     )
     return ok
 
@@ -95,11 +97,11 @@ def main():
     cases = [
         # GQA, VSA-like: Hq=8, Hkv=1; even topk
         dict(B=2, H=8, Hkv=1, nq=16, nkv=16, topk=4, seed=0),
-        # odd topk (duplicate-tail mask path)
+        # odd topk
         dict(B=2, H=8, Hkv=1, nq=16, nkv=16, topk=3, seed=1),
-        # odd, single block (pair = duplicated block only)
+        # topk=1
         dict(B=1, H=8, Hkv=1, nq=8, nkv=8, topk=1, seed=2),
-        # odd, larger, uneven nkv
+        # larger, uneven nkv
         dict(B=1, H=8, Hkv=1, nq=12, nkv=33, topk=33, seed=3),
         # MHA
         dict(B=2, H=2, Hkv=2, nq=8, nkv=16, topk=5, seed=4),
