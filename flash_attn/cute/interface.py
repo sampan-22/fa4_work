@@ -621,6 +621,7 @@ def _flash_attn_fwd(
     block_sparse_broadcast_pattern = None
     normalized_block_sparse_tensors = None
     q_subtile_factor = None
+    kv_pair_factor = 1
     if block_sparse_tensors is not None:
         if seqlen_q is None:
             raise ValueError("Block sparsity requires fixed-length sequences (seqlen_q must be known).")
@@ -628,6 +629,7 @@ def _flash_attn_fwd(
             normalized_block_sparse_tensors,
             block_sparse_broadcast_pattern,
             q_subtile_factor,
+            kv_pair_factor,
         ) = normalize_block_sparse_config(
             block_sparse_tensors,
             batch_size=batch_size,
@@ -636,7 +638,21 @@ def _flash_attn_fwd(
             seqlen_k=seqlen_k,
             block_size=(tile_m, tile_n),
             q_stage=q_stage,
+            # SM90 forward supports packing two sparse KV blocks per MMA tile.
+            allow_kv_pairing=arch // 10 == 9,
         )
+        if kv_pair_factor != 1:
+            # Paired path restrictions (SM90 forward, full-block list only).
+            assert not causal and not local, "KV pairing does not support causal/local masking"
+            assert score_mod is None and mask_mod is None, (
+                "KV pairing does not support score_mod/mask_mod"
+            )
+            assert learnable_sink is None, "KV pairing does not support learnable_sink"
+            assert page_table is None, "KV pairing does not support paged KV"
+            assert seqlen_k % (tile_n // kv_pair_factor) == 0, (
+                "KV pairing requires seqlen_k to be a multiple of the sparse KV block size "
+                "(every selected block must be a full block)"
+            )
     if aux_tensors is not None:
         aux_tensor_metadata = get_aux_tensor_metadata(aux_tensors)
     else:
@@ -680,40 +696,6 @@ def _flash_attn_fwd(
         sparse_kv = None
         disable_sparse_kv_bitmask = None
 
-    # SM90 knobs (env-driven; must be in the compile key or changing the env
-    # between calls would silently hit a stale kernel).
-    sm90_num_stages = int(os.environ.get("FLASH_ATTN_SM90_NUM_STAGES", 2))
-    # Ping-pong: two consumer warpgroups split each query tile's block list
-    # (block-sparse, full lists only - VSA guarantees empty mask lists).
-    sm90_ping_pong = os.environ.get("FLASH_ATTN_SM90_PP", "0") == "1"
-    # Anti-phase the two consumer WGs' MMA slots (FA3-style scheduler barrier).
-    sm90_pp_sched_barrier = os.environ.get("FLASH_ATTN_SM90_PP_SB", "1") == "1"
-    # Head-major CTA rasterization (better K/V L2 reuse for block sparsity).
-    sm90_head_major = os.environ.get("FLASH_ATTN_SM90_HEAD_MAJOR", "0") == "1"
-    if arch // 10 != 9 or causal or local or is_varlen:
-        sm90_head_major = False
-    # Asymmetric K/V staging (V narrower); only wired up for ping-pong.
-    sm90_num_stages_v = int(os.environ.get("FLASH_ATTN_SM90_NUM_STAGES_V", sm90_num_stages))
-    if not sm90_ping_pong:
-        sm90_num_stages_v = sm90_num_stages
-    # 2 CTAs/SM occupancy config (256-thread kernel only; exclusive with pp).
-    sm90_min_blocks = int(os.environ.get("FLASH_ATTN_SM90_MIN_BLOCKS", 1))
-    if sm90_ping_pong or arch // 10 != 9:
-        sm90_min_blocks = 1
-    if not (
-        arch // 10 == 9
-        and use_block_sparsity
-        and not causal
-        and not local
-        and score_mod is None
-        and mask_mod is None
-        and learnable_sink is None
-        and page_table is None
-        and not pack_gqa
-        and tile_m == 64
-    ):
-        sm90_ping_pong = False
-
     compile_key = (
         dtype,
         head_dim,
@@ -747,14 +729,9 @@ def _flash_attn_fwd(
         page_size not in [None, tile_n],  # paged KV non-TMA
         use_2cta_instrs,
         q_subtile_factor,
+        kv_pair_factor,
         mma_pv_is_rs,
         intra_wg_overlap,
-        sm90_num_stages,
-        sm90_num_stages_v,
-        sm90_ping_pong,
-        sm90_pp_sched_barrier,
-        sm90_head_major,
-        sm90_min_blocks,
         use_clc_scheduler,
         qv is not None,
         gather_kv_length,
@@ -863,7 +840,9 @@ def _flash_attn_fwd(
                 tile_m=tile_m,
                 tile_n=tile_n,
                 # num_stages=1,
-                num_stages=sm90_num_stages,
+                # 2 stages also for the paired path (tile_n=128 stages): a 3rd
+                # stage fits smem for hdim 128 but measured no faster.
+                num_stages=int(os.environ.get("FLASH_ATTN_SM90_NUM_STAGES", 2)),
                 num_threads=num_threads,
                 Q_in_regs=False,
                 intra_wg_overlap=intra_wg_overlap,
@@ -873,11 +852,7 @@ def _flash_attn_fwd(
                 has_aux_tensors=aux_tensors is not None,
                 q_subtile_factor=q_subtile_factor,
                 paged_kv_non_tma=page_size not in [None, tile_n],
-                ping_pong=sm90_ping_pong,
-                ping_pong_sched_barrier=sm90_pp_sched_barrier,
-                head_major_raster=sm90_head_major,
-                num_stages_v=sm90_num_stages_v,
-                min_blocks_per_mp=sm90_min_blocks,
+                kv_pair_factor=kv_pair_factor,
             )
         elif arch // 10 in [10, 11]:
             if qv is not None:

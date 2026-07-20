@@ -31,7 +31,9 @@ from flash_attn.cute.block_sparsity import BlockSparseTensors
 from flash_attn.cute.block_sparse_utils import (
     produce_block_sparse_loads,
     consume_block_sparse_loads,
-    consume_block_sparse_loads_pp,
+    produce_block_sparse_paired_loads,
+    consume_block_sparse_paired_loads,
+    paired_tail_mask,
 )
 from flash_attn.cute import pipeline as pipeline_custom
 from flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout, make_packgqa_tiled_tma_atom
@@ -56,11 +58,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         intra_wg_overlap: bool = True,
         mma_pv_is_rs: bool = True,
         paged_kv_non_tma: bool = False,
-        ping_pong: bool = False,
-        ping_pong_sched_barrier: bool = True,
-        head_major_raster: bool = False,
-        num_stages_v: Optional[int] = None,
-        min_blocks_per_mp: int = 1,
+        kv_pair_factor: int = 1,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -73,54 +71,23 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         )
         self.cluster_shape_mn = (1, 1)
         assert self.arch >= Arch.sm_90 and self.arch <= Arch.sm_90a, "Only SM 9.x is supported"
-        # Ping-pong (block-sparse, full-block lists only): two consumer
-        # warpgroups in ONE CTA (384 threads) split a query tile's selected
-        # block list by pipeline-stage parity (WG0 consumes stage sequence
-        # 0,2,...; WG1 consumes 1,3,...) over a shared K/V pipeline. Each WG
-        # keeps private softmax stats and acc_O; the partials merge
-        # SplitKV-style through smem before the epilogue. While one WG runs
-        # softmax/rescale, the other's wgmma keeps the tensor pipe busy
-        # (FA3's ping-pong adapted to a sparse per-cube list).
-        self.ping_pong = ping_pong
-        self.ping_pong_sched_barrier = ping_pong_sched_barrier
-        # Launch heads on the fastest grid dim (see SingleTileScheduler.Params.head_major).
-        self.head_major_raster = head_major_raster
-        # minnctapersm launch bound. 2 asks ptxas to cap the launch REGCOUNT
-        # at 128 so two 256-thread CTAs co-reside per SM (the default
-        # REGCOUNT of 255 occupies the whole register file, limiting to
-        # 1 CTA/SM regardless of smem). The setmaxnreg targets are adjusted
-        # in __call__ to fit the per-CTA pool of 128 x 256 registers.
-        self.min_blocks_per_mp = min_blocks_per_mp
-        assert self.min_blocks_per_mp in [1, 2]
-        if self.min_blocks_per_mp == 2:
-            assert not ping_pong, "2 CTAs/SM (256 threads) and ping-pong (384) are exclusive"
-        # Asymmetric K/V staging: V may run with fewer pipeline stages than K.
-        # V stages hold the OLDEST in-flight positions (V is released last),
-        # so narrowing V shrinks each CTA's in-flight position front - the
-        # quantity that pushes the co-resident CTAs' combined K/V working set
-        # past L2 capacity at large sizes.
-        self.num_stages_v = num_stages_v if num_stages_v is not None else self.num_stages
-        if self.num_stages_v != self.num_stages:
-            assert self.ping_pong, "asymmetric V staging is only wired up for the ping-pong path"
-            assert 1 <= self.num_stages_v <= self.num_stages
-        if self.ping_pong:
-            # Odd stage counts interleave a stage index's refills between the
-            # two consumer WGs; a reproducible Xid-43 fault at num_stages=3
-            # (even though memcheck/racecheck/synccheck come back clean) makes
-            # even counts a hard requirement until that is understood.
-            assert self.num_stages % 2 == 0 and self.num_stages_v % 2 == 0, (
-                "ping_pong requires even K/V stage counts (stage parity == WG ownership)"
+        # KV pairing: tile_n is 2x the sparse KV block size; each pipeline
+        # stage is filled by two independently selected sparse blocks (see
+        # block_sparse_utils "Paired-load path").
+        self.kv_pair_factor = kv_pair_factor
+        assert self.kv_pair_factor in [1, 2], "kv_pair_factor must be 1 or 2"
+        if self.kv_pair_factor == 2:
+            self.pair_n = self.tile_n // 2
+            assert self.pair_n == 64, "KV pairing requires tile_n == 128 (two 64-wide blocks)"
+            assert self.use_tma_KV, "KV pairing requires TMA K/V loads"
+            assert not self.Q_in_regs, "KV pairing does not support Q_in_regs"
+            assert self.tile_hdim % 64 == 0 and self.tile_hdimv % 64 == 0, (
+                "KV pairing requires head dims to be multiples of 64 (SW128 smem chunks)"
             )
-        if self.ping_pong:
-            assert self.intra_wg_overlap, "ping_pong assumes the intra-warpgroup overlap path"
-            assert self.tile_m == 64, "ping_pong runs two independent 64-row consumer WGs"
-            assert self.use_tma_KV and not self.Q_in_regs
-            assert not self.is_causal and not self.is_local, (
-                "ping_pong is only wired up for the block-sparse full-list path"
+            assert not self.check_hdim_oob and not self.check_hdim_v_oob, (
+                "KV pairing requires exact head dims"
             )
-            assert self.score_mod is None and self.mask_mod is None, (
-                "ping_pong does not support score_mod/mask_mod"
-            )
+            assert self.dtype.width == 16, "KV pairing requires 16-bit dtypes"
 
     def _get_smem_layout_atom(self):
         sQ_layout_atom = warpgroup.make_smem_layout_atom(
@@ -181,20 +148,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         sQV_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, cosize_sQV], 1024]
         cosize_sP = cute.cosize(self.sP_layout) if const_expr(self.sP_layout is not None) else 0
         sP_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, cosize_sP], 1024]
-        # Ping-pong merge buffers: WG1's f32 partial acc_O (tile_m x hdimv)
-        # plus per-(thread, row) softmax stats (row_max, row_sum).
-        cosize_merge_O = self.tile_m * self.tile_hdimv if const_expr(self.ping_pong) else 0
-        cosize_merge_stats = (
-            2 * 2 * self.num_threads_per_warp_group if const_expr(self.ping_pong) else 0
-        )
-        sMergeO_struct = cute.struct.Align[cute.struct.MemRange[Float32, cosize_merge_O], 1024]
-        sMergeStats_struct = cute.struct.Align[
-            cute.struct.MemRange[Float32, cosize_merge_stats], 16
-        ]
         # 1 stage * 2 for Q pipeline (full + empty), self.num_stages*2 for K, self.num_stages*2 for V,
         mbar_ptr_Q_struct = cute.struct.MemRange[cutlass.Int64, 1 * 2]
         mbar_ptr_K_struct = cute.struct.MemRange[cutlass.Int64, self.num_stages * 2]
-        mbar_ptr_V_struct = cute.struct.MemRange[cutlass.Int64, self.num_stages_v * 2]
+        mbar_ptr_V_struct = cute.struct.MemRange[cutlass.Int64, self.num_stages * 2]
 
         @cute.struct
         class SharedStorageQKV:
@@ -205,8 +162,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             sQ: sQ_struct
             sK: sK_struct
             sP: sP_struct
-            sMergeO: sMergeO_struct
-            sMergeStats: sMergeStats_struct
 
         @cute.struct
         class SharedStorageSharedQV:
@@ -216,8 +171,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             sQ: sQV_struct
             sK: sK_struct
             sP: sP_struct
-            sMergeO: sMergeO_struct
-            sMergeStats: sMergeStats_struct
 
         return SharedStorageQKV if const_expr(not self.Q_in_regs) else SharedStorageSharedQV
 
@@ -273,49 +226,22 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         tiled_mma_qk, tiled_mma_pv = self._get_tiled_mma()
         self.num_mma_threads = tiled_mma_qk.size
         self.num_threads_per_warp_group = 128
-        if const_expr(self.ping_pong):
-            # Two INDEPENDENT consumer warpgroups; the tiled MMA itself stays
-            # one-warpgroup (each WG computes full 64-row tiles on its own).
-            assert self.num_mma_threads == self.num_threads_per_warp_group
-            self.num_mma_threads = 2 * self.num_threads_per_warp_group
         self.num_wg_mma = self.num_mma_threads // self.num_threads_per_warp_group
         assert self.num_wg_mma in [1, 2, 3]
         self.num_threads = self.num_threads_per_warp_group * (self.num_wg_mma + 1)
         self.num_producer_threads = 32
         self.num_Q_load_threads = self.num_threads_per_warp_group  # If not TMA_Q
         self.num_epilogue_threads = self.num_mma_threads
-        if const_expr(self.ping_pong):
-            # Only WG0 owns the merged output and runs the epilogue.
-            self.num_epilogue_threads = self.num_threads_per_warp_group
         self.num_mma_regs, self.num_producer_regs = {1: (256, 56), 2: (240, 24), 3: (160, 32)}[
             self.num_wg_mma
         ]
-        if const_expr(self.min_blocks_per_mp == 2):
-            assert self.num_wg_mma == 1, "2 CTAs/SM only sized for one consumer warpgroup"
-            # Launch REGCOUNT is capped at 128 by minnctapersm=2; the per-CTA
-            # redistribution pool is 256 threads x 128 regs. Producer dec to
-            # 24 frees exactly the 104 regs/thread the consumer WG needs to
-            # inc from 128 to 232.
-            self.num_mma_regs, self.num_producer_regs = 232, 24
         self.use_block_sparsity = cutlass.const_expr(blocksparse_tensors is not None)
-        if const_expr(self.ping_pong):
-            assert self.use_block_sparsity, "ping_pong requires block sparsity"
-            assert not self.pack_gqa, "ping_pong does not support pack_gqa"
 
         self.use_scheduler_barrier = (
             (self.num_wg_mma >= 2 and self.tile_hdim <= 128)
             if const_expr(self.intra_wg_overlap)
             else (self.num_wg_mma == 2)
         )
-        if const_expr(self.ping_pong):
-            # The sync/arrive chain tolerates the odd-list imbalance without
-            # padding: WG0 (canonical warpgroup 1) always owns the ceil-half
-            # of the list AND gets the mma_init bootstrap credit, so each
-            # WG's syncs are exactly covered by the peer's arrives; at most
-            # one arrive per barrier is left un-consumed at tile end, which
-            # is harmless for the single-tile scheduler (each CTA processes
-            # exactly one work tile).
-            self.use_scheduler_barrier = self.ping_pong_sched_barrier
         self.use_tma_Q = self.arch >= Arch.sm_90 and not (
             self.pack_gqa and self.tile_m % self.qhead_per_kvhead != 0
         )
@@ -331,7 +257,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             for mX, shape, stage in [
                 (mQ, (self.tile_m, self.tile_hdim), None),
                 (mK, (self.tile_n, self.tile_hdim), self.num_stages),
-                (mV, (self.tile_n, self.tile_hdimv), self.num_stages_v),
+                (mV, (self.tile_n, self.tile_hdimv), self.num_stages),
                 (mO, (self.tile_m, self.tile_hdimv), None),
             ]
         ]
@@ -340,6 +266,32 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             self.sP_layout = sm90_utils.make_smem_layout(
                 mV.element_type, LayoutEnum.ROW_MAJOR, (self.tile_m, self.tile_n)
             )
+        # KV pairing: re-carve the same K/V smem bytes as canonical (64, 64)
+        # SW128 chunks so two TMA loads can fill the two halves of one
+        # (tile_n, hdim) stage. With the row-major (order (0,1,2)) atom
+        # stacking, stage s / hdim-chunk c / row-half h of the staged layout
+        # is exactly chunk s * (2 * n_hdim_chunks) + 2 * c + h.
+        self.sK_chunk_layout = None
+        self.sV_chunk_layout = None
+        if const_expr(self.kv_pair_factor == 2):
+            assert blocksparse_tensors is not None, "KV pairing requires block sparsity"
+            assert mPageTable is None, "KV pairing does not support paged KV"
+            self.hdim_chunks_k = self.tile_hdim // 64
+            self.hdim_chunks_v = self.tile_hdimv // 64
+            self.sK_chunk_layout = sm90_utils.make_smem_layout(
+                mK.element_type,
+                LayoutEnum.ROW_MAJOR,
+                (self.pair_n, 64),
+                self.num_stages * 2 * self.hdim_chunks_k,
+            )
+            self.sV_chunk_layout = sm90_utils.make_smem_layout(
+                mV.element_type,
+                LayoutEnum.ROW_MAJOR,
+                (self.pair_n, 64),
+                self.num_stages * 2 * self.hdim_chunks_v,
+            )
+            assert cute.cosize(self.sK_chunk_layout) == cute.cosize(self.sK_layout)
+            assert cute.cosize(self.sV_chunk_layout) == cute.cosize(self.sV_layout)
 
         SharedStorage = self._get_shared_storage_cls()
 
@@ -379,20 +331,39 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         tma_atom_K, tma_tensor_K = None, None
         tma_atom_V, tma_tensor_V = None, None
         if const_expr(self.use_tma_KV):
-            tma_atom_K, tma_tensor_K = cpasync.make_tiled_tma_atom(
-                gmem_tiled_copy_KV,
-                mK,
-                cute.select(self.sK_layout, mode=[0, 1]),
-                (self.tile_n, self.tile_hdim),
-                1,  # No mcast for now
-            )
-            tma_atom_V, tma_tensor_V = cpasync.make_tiled_tma_atom(
-                gmem_tiled_copy_KV,
-                mV,
-                cute.select(self.sV_layout, mode=[0, 1]),
-                (self.tile_n, self.tile_hdimv),
-                1,  # No mcast for now
-            )
+            if const_expr(self.kv_pair_factor == 2):
+                # (64, 64) boxes; one stage takes 2 * hdim_chunks copies per
+                # K/V, all arriving on that stage's mbarrier (tx_count is
+                # still the bytes of the full (tile_n, hdim) stage).
+                tma_atom_K, tma_tensor_K = cpasync.make_tiled_tma_atom(
+                    gmem_tiled_copy_KV,
+                    mK,
+                    cute.select(self.sK_chunk_layout, mode=[0, 1]),
+                    (self.pair_n, 64),
+                    1,  # No mcast for now
+                )
+                tma_atom_V, tma_tensor_V = cpasync.make_tiled_tma_atom(
+                    gmem_tiled_copy_KV,
+                    mV,
+                    cute.select(self.sV_chunk_layout, mode=[0, 1]),
+                    (self.pair_n, 64),
+                    1,  # No mcast for now
+                )
+            else:
+                tma_atom_K, tma_tensor_K = cpasync.make_tiled_tma_atom(
+                    gmem_tiled_copy_KV,
+                    mK,
+                    cute.select(self.sK_layout, mode=[0, 1]),
+                    (self.tile_n, self.tile_hdim),
+                    1,  # No mcast for now
+                )
+                tma_atom_V, tma_tensor_V = cpasync.make_tiled_tma_atom(
+                    gmem_tiled_copy_KV,
+                    mV,
+                    cute.select(self.sV_layout, mode=[0, 1]),
+                    (self.tile_n, self.tile_hdimv),
+                    1,  # No mcast for now
+                )
         tma_atom_O, tma_tensor_O = None, None
         if const_expr(self.use_tma_O):
             mO_tma = mO_og if const_expr(self.pack_gqa) else mO
@@ -436,7 +407,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             element_size=self.dtype.width // 8,
             is_persistent=False,
             lpt=self.is_causal or self.is_local,
-            head_swizzle=self.head_major_raster,
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
@@ -475,6 +445,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             self.sV_layout,
             self.sO_layout,
             self.sP_layout,
+            self.sK_chunk_layout,
+            self.sV_chunk_layout,
             self.gmem_tiled_copy_Q,
             self.gmem_tiled_copy_K,
             self.gmem_tiled_copy_V,
@@ -490,7 +462,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
             stream=stream,
-            min_blocks_per_mp=self.min_blocks_per_mp,
+            min_blocks_per_mp=1,
         )
 
     @cute.kernel
@@ -521,6 +493,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         sV_layout: cute.ComposedLayout,
         sO_layout: cute.ComposedLayout,
         sP_layout: cute.ComposedLayout | None,
+        sK_chunk_layout: cute.ComposedLayout | None,
+        sV_chunk_layout: cute.ComposedLayout | None,
         gmem_tiled_copy_Q: cute.TiledCopy,
         gmem_tiled_copy_K: cute.TiledCopy,
         gmem_tiled_copy_V: cute.TiledCopy,
@@ -550,15 +524,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         tma_warp = ThreadCooperativeGroup(1)
         load_threads = ThreadCooperativeGroup(self.num_threads_per_warp_group)
         mma_warps = ThreadCooperativeGroup(self.num_mma_threads // cute.arch.WARP_SIZE)
-        # Ping-pong: each K/V stage is consumed and released by exactly ONE of
-        # the two consumer warpgroups (stage-sequence parity), so the empty
-        # barrier must expect a single warpgroup's worth of arrives. Q is
-        # still consumed and released by all consumer warps.
-        kv_release_warps = (
-            ThreadCooperativeGroup(self.num_threads_per_warp_group // cute.arch.WARP_SIZE)
-            if const_expr(self.ping_pong)
-            else mma_warps
-        )
         if const_expr(self.use_tma_Q):
             pipeline_q = pipeline_custom.PipelineTmaAsync.create(
                 barrier_storage=mbar_ptr_Q,
@@ -584,15 +549,15 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 barrier_storage=storage.mbar_ptr_K.data_ptr(),
                 num_stages=self.num_stages,
                 producer_group=tma_warp,
-                consumer_group=kv_release_warps,
+                consumer_group=mma_warps,
                 tx_count=self.tma_copy_bytes["K"],
                 defer_sync=True,
             )
             pipeline_v = pipeline_custom.PipelineTmaAsync.create(
                 barrier_storage=storage.mbar_ptr_V.data_ptr(),
-                num_stages=self.num_stages_v,
+                num_stages=self.num_stages,
                 producer_group=tma_warp,
-                consumer_group=kv_release_warps,
+                consumer_group=mma_warps,
                 tx_count=self.tma_copy_bytes["V"],
                 defer_sync=True,
             )
@@ -632,28 +597,21 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             )
         # Transpose view of V to tensor with layout (head_dim_v, tile_n) for tiled mma
         sVt = layout_utils.transpose_view(sV)
+        # KV pairing: same K/V bytes re-carved as (64, 64) chunks for TMA.
+        sK_chunks = None
+        sV_chunks = None
+        if const_expr(self.kv_pair_factor == 2):
+            sK_chunks = storage.sK.get_tensor(
+                sK_chunk_layout.outer, swizzle=sK_chunk_layout.inner
+            )
+            sV_chunks = storage.sV.get_tensor(
+                sV_chunk_layout.outer, swizzle=sV_chunk_layout.inner
+            )
         sP = None
         if const_expr(sP_layout is not None):
             sP = storage.sP.get_tensor(sP_layout.outer, swizzle=sP_layout.inner)
         # reuse sQ's data iterator
         sO = storage.sQ.get_tensor(sO_layout.outer, swizzle=sO_layout.inner, dtype=self.dtype)
-        # Ping-pong merge buffers: per-thread contiguous f32 chunks, indexed by
-        # the thread's position within its warpgroup (both WGs share the same
-        # fragment layout, so WG0's thread t reads exactly what WG1's thread t
-        # wrote).
-        sMergeO = None
-        sMergeStats = None
-        if const_expr(self.ping_pong):
-            vals_per_thread = self.tile_m * self.tile_hdimv // self.num_threads_per_warp_group
-            sMergeO = storage.sMergeO.get_tensor(
-                cute.make_layout(
-                    (self.num_threads_per_warp_group, vals_per_thread),
-                    stride=(vals_per_thread, 1),
-                )
-            )
-            sMergeStats = storage.sMergeStats.get_tensor(
-                cute.make_layout((self.num_threads_per_warp_group, 2, 2), stride=(4, 2, 1))
-            )
 
         block_info = BlockInfo(
             self.tile_m,
@@ -699,6 +657,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 sQ,
                 sK,
                 sV,
+                sK_chunks,
+                sV_chunks,
                 tma_atom_Q,
                 tma_atom_K,
                 tma_atom_V,
@@ -746,8 +706,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 blocksparse_tensors,
                 aux_tensors,
                 fastdiv_mods,
-                sMergeO,
-                sMergeStats,
             )
 
     @cute.jit
@@ -759,6 +717,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         sQ: cute.Tensor,
         sK: cute.Tensor,
         sV: cute.Tensor,
+        sK_chunks: Optional[cute.Tensor],
+        sV_chunks: Optional[cute.Tensor],
         tma_atom_Q: Optional[cute.CopyAtom],
         tma_atom_K: Optional[cute.CopyAtom],
         tma_atom_V: Optional[cute.CopyAtom],
@@ -807,7 +767,54 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 paged_kv_manager = None
                 tma_load_K_fn = None
                 tma_load_V_fn = None
-                if const_expr(self.use_tma_KV):
+                load_K_pair = None
+                load_V_pair = None
+                if const_expr(self.use_tma_KV and self.kv_pair_factor == 2):
+                    # === Paired TMA path (block sparse, tile_n = 2 * sparse block) ===
+                    # (pair_n, 64) chunk copies: gmem is tiled at the sparse
+                    # block granularity (pair_n rows) x 64-wide hdim chunks;
+                    # smem destination is the chunk-carved view of the same
+                    # bytes as sK/sV. Both halves of a stage arrive on that
+                    # stage's mbarrier; tx_count is the full-stage byte count.
+                    mK_cur = seqlen.offset_batch_K(mK, batch_idx, dim=3)[None, None, head_idx_kv]
+                    mV_cur = seqlen.offset_batch_K(mV, batch_idx, dim=3)[None, None, head_idx_kv]
+                    copy_K_chunk = []
+                    copy_V_chunk = []
+                    for c in cutlass.range_constexpr(self.hdim_chunks_k):
+                        gK_c = cute.local_tile(mK_cur, (self.pair_n, 64), (None, c))
+                        fn, _, _ = copy_utils.tma_get_copy_fn(
+                            tma_atom_K, 0, cute.make_layout(1), gK_c, sK_chunks
+                        )
+                        copy_K_chunk.append(fn)
+                    for c in cutlass.range_constexpr(self.hdim_chunks_v):
+                        gV_c = cute.local_tile(mV_cur, (self.pair_n, 64), (None, c))
+                        fn, _, _ = copy_utils.tma_get_copy_fn(
+                            tma_atom_V, 0, cute.make_layout(1), gV_c, sV_chunks
+                        )
+                        copy_V_chunk.append(fn)
+
+                    def load_K_pair(n_block_a, n_block_b, producer_state):
+                        bar = pipeline_k.producer_get_barrier(producer_state)
+                        base = producer_state.index * (2 * self.hdim_chunks_k)
+                        for c in cutlass.range_constexpr(self.hdim_chunks_k):
+                            copy_K_chunk[c](
+                                src_idx=n_block_a, dst_idx=base + 2 * c, tma_bar_ptr=bar
+                            )
+                            copy_K_chunk[c](
+                                src_idx=n_block_b, dst_idx=base + 2 * c + 1, tma_bar_ptr=bar
+                            )
+
+                    def load_V_pair(n_block_a, n_block_b, producer_state):
+                        bar = pipeline_v.producer_get_barrier(producer_state)
+                        base = producer_state.index * (2 * self.hdim_chunks_v)
+                        for c in cutlass.range_constexpr(self.hdim_chunks_v):
+                            copy_V_chunk[c](
+                                src_idx=n_block_a, dst_idx=base + 2 * c, tma_bar_ptr=bar
+                            )
+                            copy_V_chunk[c](
+                                src_idx=n_block_b, dst_idx=base + 2 * c + 1, tma_bar_ptr=bar
+                            )
+                elif const_expr(self.use_tma_KV):
                     # === TMA path (non-paged and paged with page_size == n_block_size) ===
                     if const_expr(mPageTable is not None):
                         # Paged TMA: keep page dimension indexable
@@ -1001,21 +1008,36 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         pipeline_q.producer_commit_w_index(0)
                         q_producer_phase ^= 1
                     if is_kv_load_warp:
-                        kv_producer_state = produce_block_sparse_loads(
-                            blocksparse_tensors,
-                            batch_idx,
-                            head_idx,
-                            m_block,
-                            kv_producer_state,
-                            tma_load_K_fn,
-                            tma_load_V_fn,
-                            pipeline_k,
-                            pipeline_v,
-                            self.intra_wg_overlap,
-                            self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
-                            self.q_subtile_factor if self.q_subtile_factor is not None else 1,
-                            v_state_view=partial(self.v_state_view, producer=True),
-                        )
+                        if const_expr(self.kv_pair_factor == 2):
+                            kv_producer_state = produce_block_sparse_paired_loads(
+                                blocksparse_tensors,
+                                batch_idx,
+                                head_idx,
+                                m_block,
+                                kv_producer_state,
+                                load_K_pair,
+                                load_V_pair,
+                                pipeline_k,
+                                pipeline_v,
+                                self.intra_wg_overlap,
+                                self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+                                self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                            )
+                        else:
+                            kv_producer_state = produce_block_sparse_loads(
+                                blocksparse_tensors,
+                                batch_idx,
+                                head_idx,
+                                m_block,
+                                kv_producer_state,
+                                tma_load_K_fn,
+                                tma_load_V_fn,
+                                pipeline_k,
+                                pipeline_v,
+                                self.intra_wg_overlap,
+                                self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+                                self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                            )
 
                 tile_scheduler.prefetch_next_work()
                 tile_scheduler.advance_to_next_work()
@@ -1026,96 +1048,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             # We only need producer_tail on V since that's the last that's loaded, we don't
             # need it for Q (no cluster) and K.
             if is_kv_load_warp:
-                pipeline_v.producer_tail(self.v_state_view(kv_producer_state, producer=True))
-
-    def _pp_state_at(self, count):
-        """Consumer PipelineState positioned at absolute stage-sequence number
-        `count` (index = count % stages, phase = parity of wraps; consumers
-        start at phase 0). Plain Python trace-time helper on purpose."""
-        ns = self.num_stages
-        return pipeline.PipelineState(ns, count, count % ns, (count // ns) % 2)
-
-    def v_state_view(self, state, producer: bool = False):
-        """Re-interpret a K-threaded pipeline state for the V pipeline when V
-        has a different (smaller) stage count.
-
-        PipelineState.count is the monotonic stage-sequence number, identical
-        for K and V; only the (index, phase) decomposition depends on the
-        stage count: index = count % stages, phase = phase0 ^ ((count //
-        stages) % 2), with phase0 = 1 for producers (empty buffer, flipped
-        phase) and 0 for consumers. Identity when the counts match. Plain
-        Python trace-time helper on purpose.
-        """
-        if self.num_stages_v == self.num_stages:
-            return state
-        phase0 = 1 if producer else 0
-        count = state.count
-        if self.num_stages_v == 1:
-            index = Int32(0)
-            phase = phase0 ^ (count % 2)
-        else:
-            index = count % self.num_stages_v
-            phase = phase0 ^ ((count // self.num_stages_v) % 2)
-        return pipeline.PipelineState(self.num_stages_v, count, index, phase)
-
-    @cute.jit
-    def pp_merge(
-        self,
-        acc_O: cute.Tensor,
-        softmax: Softmax,
-        sMergeO: cute.Tensor,
-        sMergeStats: cute.Tensor,
-        tidx_mma: Int32,
-        warp_group_idx: Int32,
-        softmax_scale_log2: Float32,
-    ):
-        """SplitKV-style merge of the two consumer WGs' partial results.
-
-        WG1 hands its unnormalized acc_O and per-row (max, sum) stats to WG0
-        through smem; WG0 rescales both partials to the joint row max and
-        accumulates. Thread t of WG0 reads exactly thread t of WG1's values
-        (identical fragment layouts), so the merge is register-local except
-        for one smem round trip. Stats here are still quad-partial (per
-        thread's columns); softmax.finalize's quad reduction runs after.
-        """
-        num_rows = cute.size(softmax.row_max)
-        if warp_group_idx == 1:
-            sO1 = sMergeO[tidx_mma, None]
-            for i in cutlass.range(cute.size(acc_O), unroll_full=True):
-                sO1[i] = acc_O[i]
-            for r in cutlass.range(num_rows, unroll_full=True):
-                sMergeStats[tidx_mma, r, 0] = softmax.row_max[r]
-                sMergeStats[tidx_mma, r, 1] = softmax.row_sum[r]
-            cute.arch.barrier_arrive(
-                barrier_id=int(NamedBarrierFwd.PingPongMerge),
-                number_of_threads=2 * self.num_threads_per_warp_group,
-            )
-        if warp_group_idx == 0:
-            cute.arch.barrier(
-                barrier_id=int(NamedBarrierFwd.PingPongMerge),
-                number_of_threads=2 * self.num_threads_per_warp_group,
-            )
-            tOrO1 = cute.make_fragment_like(acc_O)
-            sO1 = sMergeO[tidx_mma, None]
-            for i in cutlass.range(cute.size(acc_O), unroll_full=True):
-                tOrO1[i] = sO1[i]
-            acc_O_mn = layout_utils.reshape_acc_to_mn(acc_O)
-            acc_O1_mn = layout_utils.reshape_acc_to_mn(tOrO1)
-            for r in cutlass.range(num_rows, unroll_full=True):
-                m0 = softmax.row_max[r]
-                s0 = softmax.row_sum[r]
-                m1 = sMergeStats[tidx_mma, r, 0]
-                s1 = sMergeStats[tidx_mma, r, 1]
-                m_new = cutlass.max(m0, m1)
-                # Avoid NaN from (-inf) - (-inf); exp2(-inf) itself is 0.
-                m_safe = 0.0 if m_new == -Float32.inf else m_new
-                a0 = cute.math.exp2((m0 - m_safe) * softmax_scale_log2, fastmath=True)
-                a1 = cute.math.exp2((m1 - m_safe) * softmax_scale_log2, fastmath=True)
-                softmax.row_max[r] = m_new
-                softmax.row_sum[r] = s0 * a0 + s1 * a1
-                acc_O_mn[r, None].store(
-                    acc_O_mn[r, None].load() * a0 + acc_O1_mn[r, None].load() * a1
-                )
+                pipeline_v.producer_tail(kv_producer_state)
 
     @cute.jit
     def load_KV(
@@ -1165,24 +1098,14 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         blocksparse_tensors: Optional[BlockSparseTensors],
         aux_tensors: Optional[list],
         fastdiv_mods=None,
-        sMergeO: Optional[cute.Tensor] = None,
-        sMergeStats: Optional[cute.Tensor] = None,
     ):
         warp_group_idx = cute.arch.make_warp_uniform(tidx // self.num_threads_per_warp_group)
         warp_group_thread_layout = cute.make_layout(
             self.num_wg_mma, stride=self.num_threads_per_warp_group
         )
-        if const_expr(self.ping_pong):
-            # Two independent consumer WGs on a one-warpgroup tiled MMA: both
-            # WGs use identical (per-WG) thread slices and fragment layouts.
-            tidx_mma = tidx % self.num_threads_per_warp_group
-            wg_mma_qk = tiled_mma_qk.get_slice(0)
-            wg_mma_pv = tiled_mma_pv.get_slice(0)
-        else:
-            tidx_mma = tidx
-            wg_mma_qk = tiled_mma_qk.get_slice(warp_group_thread_layout(warp_group_idx))
-            wg_mma_pv = tiled_mma_pv.get_slice(warp_group_thread_layout(warp_group_idx))
-        thr_mma_qk = tiled_mma_qk.get_slice(tidx_mma)
+        thr_mma_qk = tiled_mma_qk.get_slice(tidx)
+        wg_mma_qk = tiled_mma_qk.get_slice(warp_group_thread_layout(warp_group_idx))
+        wg_mma_pv = tiled_mma_pv.get_slice(warp_group_thread_layout(warp_group_idx))
         _, tSrQ, tSrK = sm90_utils.partition_fragment_ABC(
             wg_mma_qk, (self.tile_m, self.tile_n, self.tile_hdim), sQ, sK
         )
@@ -1200,9 +1123,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         smem_copy_atom_P = utils.get_smem_store_atom(
             self.arch.major * 10 + self.arch.minor, self.dtype
         )
-        smem_thr_copy_P = cute.make_tiled_copy_C(smem_copy_atom_P, tiled_mma_qk).get_slice(
-            tidx_mma
-        )
+        smem_thr_copy_P = cute.make_tiled_copy_C(smem_copy_atom_P, tiled_mma_qk).get_slice(tidx)
         tPsP = smem_thr_copy_P.partition_D(sP) if const_expr(sP is not None) else None
         smem_copy_params = SimpleNamespace(smem_thr_copy_P=smem_thr_copy_P, tPsP=tPsP)
 
@@ -1409,37 +1330,38 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 # ==========================================
                 # Block sparsity
                 # ==========================================
-                if const_expr(self.ping_pong):
-                    # Each WG consumes the stage-sequence of its parity; its
-                    # pipeline state starts offset by the WG index and the
-                    # helpers advance it by 2. After the tile, resync the
-                    # threaded state to base + total consumed stages.
-                    base_count = kv_consumer_state.count
-                    my_state = self._pp_state_at(base_count + warp_group_idx)
+                if const_expr(self.kv_pair_factor == 2):
+                    pair_tail_mask_fn = partial(
+                        paired_tail_mask,
+                        thr_mma=thr_mma_qk,
+                        tile_m=self.tile_m,
+                        tile_n=self.tile_n,
+                    )
                     (
-                        my_state,
+                        kv_consumer_state,
                         O_should_accumulate,
                         processed_any,
-                        my_tiles,
-                        total_tiles,
-                    ) = consume_block_sparse_loads_pp(
+                    ) = consume_block_sparse_paired_loads(
                         blocksparse_tensors,
                         batch_idx,
                         head_idx,
                         m_block,
                         seqlen,
-                        my_state,
+                        kv_consumer_state,
                         mma_pv_fn,
                         mma_one_n_block,
                         process_first_half_block,
                         process_last_half_block,
-                        mask_fn,
+                        pair_tail_mask_fn,
+                        score_mod_fn,
                         O_should_accumulate,
-                        warp_group_idx,
+                        self.intra_wg_overlap,
+                        self.warp_scheduler_barrier_sync,
+                        self.warp_scheduler_barrier_arrive,
+                        self.tile_n,
                         self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
                         self.q_subtile_factor if self.q_subtile_factor is not None else 1,
                     )
-                    kv_consumer_state = self._pp_state_at(base_count + total_tiles)
                 else:
                     (
                         kv_consumer_state,
@@ -1472,27 +1394,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 pipeline_q.consumer_release_w_index(0)
 
                 # Handle empty case (when no blocks to process)
-                if const_expr(self.ping_pong):
-                    # A WG with no tiles (empty list, or a single-tile list
-                    # whose only stage has the other parity) must contribute
-                    # neutral stats and a zero partial to the merge.
-                    if my_tiles == 0:
-                        softmax.reset()
-                        acc_O.fill(0.0)
-                    if processed_any:
-                        self.pp_merge(
-                            acc_O,
-                            softmax,
-                            sMergeO,
-                            sMergeStats,
-                            tidx_mma,
-                            warp_group_idx,
-                            softmax_scale_log2,
-                        )
-                else:
-                    if not processed_any:
-                        softmax.reset()
-                        acc_O.fill(0.0)
+                if not processed_any:
+                    softmax.reset()
+                    acc_O.fill(0.0)
 
             q_consumer_phase ^= 1
 
@@ -1509,49 +1413,28 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         q_head_idx = row % self.qhead_per_kvhead + head_idx * self.qhead_per_kvhead
                         sink_val[r] = Float32(learnable_sink[q_head_idx])
 
-            if const_expr(self.ping_pong):
-                # WG0 owns the merged result; WG1 is done with this tile.
-                if warp_group_idx == 0:
-                    row_scale = softmax.finalize(sink_val=sink_val)
-                    softmax.rescale_O(acc_O, row_scale)
-                    self.epilogue(
-                        acc_O,
-                        softmax.row_sum,
-                        mO,
-                        mLSE,
-                        sO,
-                        seqlen,
-                        gmem_tiled_copy_O,
-                        tma_atom_O,
-                        tiled_mma_pv,
-                        tidx_mma,
-                        m_block,
-                        head_idx,
-                        batch_idx,
-                    )
-            else:
-                # normalize acc_O by row_sum and calculate the lse
-                row_scale = softmax.finalize(sink_val=sink_val)
-                softmax.rescale_O(acc_O, row_scale)
+            # normalize acc_O by row_sum and calculate the lse
+            row_scale = softmax.finalize(sink_val=sink_val)
+            softmax.rescale_O(acc_O, row_scale)
 
-                # ///////////////////////////////////////////////////////////////////////////////
-                # Epilogue
-                # ///////////////////////////////////////////////////////////////////////////////
-                self.epilogue(
-                    acc_O,
-                    softmax.row_sum,
-                    mO,
-                    mLSE,
-                    sO,
-                    seqlen,
-                    gmem_tiled_copy_O,
-                    tma_atom_O,
-                    tiled_mma_pv,
-                    tidx,
-                    m_block,
-                    head_idx,
-                    batch_idx,
-                )
+            # ///////////////////////////////////////////////////////////////////////////////
+            # Epilogue
+            # ///////////////////////////////////////////////////////////////////////////////
+            self.epilogue(
+                acc_O,
+                softmax.row_sum,
+                mO,
+                mLSE,
+                sO,
+                seqlen,
+                gmem_tiled_copy_O,
+                tma_atom_O,
+                tiled_mma_pv,
+                tidx,
+                m_block,
+                head_idx,
+                batch_idx,
+            )
 
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
@@ -1629,15 +1512,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         if const_expr(self.rescale_O_before_gemm):
             softmax.rescale_O(acc_O, scores_scale)
 
-        kv_consumer_state_v = self.v_state_view(kv_consumer_state)
-        pipeline_v.consumer_wait(
-            kv_consumer_state_v, pipeline_v.consumer_try_wait(kv_consumer_state_v)
-        )
-        mma_pv_fn(B_idx=kv_consumer_state_v.index, zero_init=zero_init, wg_wait=0)
-        pipeline_v.consumer_release(kv_consumer_state_v)
+        pipeline_v.consumer_wait(kv_consumer_state, pipeline_v.consumer_try_wait(kv_consumer_state))
+        mma_pv_fn(B_idx=kv_consumer_state.index, zero_init=zero_init, wg_wait=0)
+        pipeline_v.consumer_release(kv_consumer_state)
         kv_consumer_state.advance()
-        if const_expr(self.ping_pong):
-            kv_consumer_state.advance()
         return kv_consumer_state
 
     @cute.jit
@@ -1694,12 +1572,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             # Fence and barrier to make sure smem store is visible to WGMMA
             cute.arch.fence_view_async_shared()
             cute.arch.sync_warp()  # Only need syncwarp since each warp is using its own P values for MmaPV
-        smem_pipe_read_v = self.v_state_view(smem_pipe_read)
-        pipeline_v.consumer_wait(smem_pipe_read_v, pipeline_v.consumer_try_wait(smem_pipe_read_v))
+        pipeline_v.consumer_wait(smem_pipe_read, pipeline_v.consumer_try_wait(smem_pipe_read))
         self.warp_scheduler_barrier_sync()
         # O += P @ V
-        mma_pv_fn(B_idx=smem_pipe_read_v.index, wg_wait=0)
-        pipeline_v.consumer_release(smem_pipe_read_v)
+        mma_pv_fn(B_idx=smem_pipe_read.index, wg_wait=0)
+        pipeline_v.consumer_release(smem_pipe_read)
         smem_pipe_read.advance()
         return smem_pipe_read
 
@@ -1722,12 +1599,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mask_fn: Optional[Callable] = None,
         check_inf: cutlass.Constexpr = True,
     ):
-        smem_pipe_read_v = self.v_state_view(smem_pipe_read.clone())
+        smem_pipe_read_v = smem_pipe_read.clone()
         smem_pipe_read.advance()
-        if const_expr(self.ping_pong):
-            # Stride-2 stage consumption: this WG's next K sits two stages
-            # ahead (the stage in between belongs to the other warpgroup).
-            smem_pipe_read.advance()
         pipeline_k.consumer_wait(smem_pipe_read, pipeline_k.consumer_try_wait(smem_pipe_read))
         self.warp_scheduler_barrier_sync()
         # S = Q @ K.T

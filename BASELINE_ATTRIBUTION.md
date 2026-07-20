@@ -100,16 +100,16 @@ resident CTAs doubles the concurrent random-cube footprint per SM,
 L2 hit rate drops, and the un-hidable TMA latency eats the win. The
 success bar lives at 128k, so 2-CTA occupancy is the wrong vehicle.
 
-## 5. Direction picked: intra-CTA ping-pong (candidate B)
+## 5. Direction history
 
-Two consumer WGs in ONE CTA (384 threads) over ONE shared K/V pipeline
-and ONE Q copy, splitting each query cube's selected-block list by
-pipeline-stage parity (WG0 → stages 0,2,…; WG1 → 1,3,…), private
-softmax stats + acc_O per WG, one SplitKV-style f32 merge through smem
-before the epilogue. This reproduces dense FA4's two-consumer-WG
-concurrency *without* changing the attended set, the selection
-granularity, or the per-SM memory footprint (same one pipeline, same
-K/V traffic) — i.e., it should keep the ≤64k win and not pay the 128k
-L2 penalty. Register budget is the dense 2-WG budget (168 launch,
-240/24 after redistribute). Pipeline consumer-arrive counts drop to one
-warpgroup (4 warps) per K/V stage; Q stays at 8 warps.
+Candidate B (intra-CTA ping-pong: two consumer warpgroups in one CTA
+splitting the block list by pipeline-stage parity, SplitKV-style merge)
+was implemented and measured on branch history now removed from this
+tree — it recovered the ≤64k win without the 2-CTA's 128k L2 penalty,
+but the code path was judged not worth keeping (issue-slot contention
+between the two warpgroups capped delivered MFU well below the tensor
+pipe's measured occupancy, and the implementation complexity/fragility
+— e.g. an unexplained Xid-43 fault at odd pipeline-stage counts — wasn't
+worth the ~1pp it bought at 128k). The current 128k direction is
+KV-pairing (`kv_pair_factor=2`, see the repo's kv-pairing docs/history)
+instead.
