@@ -13,6 +13,7 @@ import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr
 
 from quack import copy_utils
+from quack import layout_utils
 
 # Import data structures from block_sparsity
 from flash_attn.cute.block_sparsity import BlockSparseTensors
@@ -474,6 +475,364 @@ def consume_block_sparse_loads(
                 O_should_accumulate = True
 
         if curr_mask_block_cnt + curr_full_block_cnt > 0:
+            kv_consumer_state = process_last_half_block(
+                kv_consumer_state=kv_consumer_state,
+                zero_init=not O_should_accumulate,
+            )
+            O_should_accumulate = True
+
+    return kv_consumer_state, O_should_accumulate, processed_any
+
+
+# ============================================================================
+# SM90 sparse M64N128 chunking experiment
+#
+# Sparse metadata remains in N64 units.  The producer gathers two list entries
+# into the low/high halves of one N128 K/V stage and the consumer executes one
+# N128 QK/softmax/PV tile.  Valid columns follow the same reverse order as the
+# baseline helpers above.  For an odd list, the highest ordinal is transported
+# first with a duplicated/masked peer; descending two-entry pairs follow.
+# ============================================================================
+
+
+@cute.jit
+def sparse_m64n128_tail_mask(
+    acc_S: cute.Tensor,
+    col_limit: Int32,
+    thr_mma: cute.TiledMma,
+    tile_m: cutlass.Constexpr[int],
+    tile_n: cutlass.Constexpr[int],
+    n_block: Int32 = 0,
+    mask_seqlen: cutlass.Constexpr[bool] = False,
+):
+    """Mask the duplicated high half of an odd N64 source-block pair."""
+    # All regular pairs pass col_limit=N128.  Keep that steady-state path to
+    # one uniform branch; only the actual odd tail touches score elements.
+    if col_limit < Int32(tile_n):
+        acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S)
+        cS = cute.make_identity_tensor((tile_m, tile_n))
+        tScS_mn = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(cS))
+        t0ScS_mn = layout_utils.reshape_acc_to_mn(thr_mma.get_slice(0).partition_C(cS))
+        limit = col_limit - tScS_mn[0][1]
+        for c in cutlass.range(cute.size(tScS_mn.shape[1]), unroll_full=True):
+            oob = t0ScS_mn[0, c][1] >= limit
+            for r in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
+                acc_S_mn[r, c] = -Float32.inf if oob else acc_S_mn[r, c]
+
+
+@cute.jit
+def sparse_reverse_pair(
+    block_indices: cute.Tensor,
+    block_count,
+    pair_idx,
+):
+    ordinal0 = block_count - Int32(1) - pair_idx * Int32(2)
+    # For an odd list, consume the unpaired highest ordinal first, then
+    # continue with descending pairs.  This keeps the complete valid-column
+    # stream byte-for-byte in baseline reverse-list order while placing the
+    # padded transaction in the overlap prologue instead of the steady state.
+    if block_count % Int32(2) == Int32(1) and pair_idx > Int32(0):
+        ordinal0 = ordinal0 + Int32(1)
+    ordinal1 = ordinal0 - Int32(1)
+    if ordinal1 < Int32(0):
+        ordinal1 = ordinal0
+    return block_indices[ordinal0], block_indices[ordinal1]
+
+
+@cute.jit
+def load_sparse_m64n128_block_list(
+    block_indices: cute.Tensor,
+    block_count,
+    kv_producer_state,
+    load_K_pair,
+    load_V_pair,
+    pipeline_k,
+    pipeline_v,
+    intra_wg_overlap: cutlass.Constexpr,
+):
+    """Produce N128 stages from reverse-ordered pairs of N64 list entries."""
+    if block_count > 0:
+        pair_count = (block_count + Int32(1)) // Int32(2)
+        block0, block1 = sparse_reverse_pair(
+            block_indices, block_count, Int32(0)
+        )
+        pipeline_k.producer_acquire(kv_producer_state)
+        load_K_pair(block0, block1, kv_producer_state)
+
+        if const_expr(not intra_wg_overlap):
+            pipeline_v.producer_acquire(kv_producer_state)
+            load_V_pair(block0, block1, kv_producer_state)
+            kv_producer_state.advance()
+            for pair_idx in cutlass.range(1, pair_count, unroll=1):
+                block0, block1 = sparse_reverse_pair(
+                    block_indices, block_count, pair_idx
+                )
+                pipeline_k.producer_acquire(kv_producer_state)
+                load_K_pair(block0, block1, kv_producer_state)
+                pipeline_v.producer_acquire(kv_producer_state)
+                load_V_pair(block0, block1, kv_producer_state)
+                kv_producer_state.advance()
+        else:
+            for pair_idx in cutlass.range(1, pair_count, unroll=1):
+                prev0, prev1 = sparse_reverse_pair(
+                    block_indices, block_count, pair_idx - Int32(1)
+                )
+                block0, block1 = sparse_reverse_pair(
+                    block_indices, block_count, pair_idx
+                )
+                kv_producer_state_prev = kv_producer_state.clone()
+                kv_producer_state.advance()
+                pipeline_k.producer_acquire(kv_producer_state)
+                load_K_pair(block0, block1, kv_producer_state)
+                pipeline_v.producer_acquire(kv_producer_state_prev)
+                load_V_pair(prev0, prev1, kv_producer_state_prev)
+            last0, last1 = sparse_reverse_pair(
+                block_indices, block_count, pair_count - Int32(1)
+            )
+            pipeline_v.producer_acquire(kv_producer_state)
+            load_V_pair(last0, last1, kv_producer_state)
+            kv_producer_state.advance()
+
+    return kv_producer_state
+
+
+@cute.jit
+def produce_block_sparse_m64n128_loads(
+    blocksparse_tensors: BlockSparseTensors,
+    batch_idx,
+    head_idx,
+    m_block,
+    kv_producer_state,
+    load_K_pair,
+    load_V_pair,
+    pipeline_k,
+    pipeline_v,
+    intra_wg_overlap: cutlass.Constexpr,
+    qhead_per_kvhead: cutlass.Constexpr[int] = 1,
+    q_subtile_factor: cutlass.Constexpr[int] = 1,
+):
+    """Pair the existing masked list, then the existing full list."""
+    mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = blocksparse_tensors
+    m_block_sparse = sparse_tensor_m_block(m_block, qhead_per_kvhead, q_subtile_factor)
+
+    curr_mask_block_cnt = mask_block_cnt[batch_idx, head_idx, m_block_sparse]
+    curr_mask_block_idx = mask_block_idx[batch_idx, head_idx, m_block_sparse, None]
+    kv_producer_state = load_sparse_m64n128_block_list(
+        curr_mask_block_idx,
+        curr_mask_block_cnt,
+        kv_producer_state,
+        load_K_pair,
+        load_V_pair,
+        pipeline_k,
+        pipeline_v,
+        intra_wg_overlap,
+    )
+
+    if const_expr(full_block_cnt is not None):
+        curr_full_block_cnt = full_block_cnt[batch_idx, head_idx, m_block_sparse]
+        curr_full_block_idx = full_block_idx[batch_idx, head_idx, m_block_sparse, None]
+        kv_producer_state = load_sparse_m64n128_block_list(
+            curr_full_block_idx,
+            curr_full_block_cnt,
+            kv_producer_state,
+            load_K_pair,
+            load_V_pair,
+            pipeline_k,
+            pipeline_v,
+            intra_wg_overlap,
+        )
+    return kv_producer_state
+
+
+@cute.jit
+def sparse_m64n128_col_limit(
+    block_count,
+    pair_idx,
+    tile_n: cutlass.Constexpr[int],
+):
+    is_odd_tail = (
+        block_count % Int32(2) == Int32(1)
+        and pair_idx == Int32(0)
+    )
+    col_limit = Int32(tile_n)
+    if is_odd_tail:
+        col_limit = Int32(tile_n // 2)
+    return col_limit
+
+
+@cute.jit
+def consume_block_sparse_m64n128_loads(
+    blocksparse_tensors: BlockSparseTensors,
+    batch_idx,
+    head_idx,
+    m_block,
+    seqlen,
+    kv_consumer_state,
+    mma_pv_fn,
+    mma_one_n_block,
+    process_first_half_block,
+    process_last_half_block,
+    pair_tail_mask_fn,
+    O_should_accumulate,
+    intra_wg_overlap: cutlass.Constexpr,
+    warp_scheduler_barrier_sync: Callable,
+    warp_scheduler_barrier_arrive: Callable,
+    tile_n: cutlass.Constexpr[int],
+    qhead_per_kvhead: cutlass.Constexpr[int] = 1,
+    q_subtile_factor: cutlass.Constexpr[int] = 1,
+):
+    """Consume paired masked/full lists as genuine N128 MMA tiles."""
+    mask_block_cnt, _, full_block_cnt, _ = blocksparse_tensors
+    m_block_sparse = sparse_tensor_m_block(m_block, qhead_per_kvhead, q_subtile_factor)
+    curr_mask_block_cnt = mask_block_cnt[batch_idx, head_idx, m_block_sparse]
+    curr_full_block_cnt = (
+        full_block_cnt[batch_idx, head_idx, m_block_sparse]
+        if const_expr(full_block_cnt is not None)
+        else Int32(0)
+    )
+    mask_pair_count = (curr_mask_block_cnt + Int32(1)) // Int32(2)
+    full_pair_count = (curr_full_block_cnt + Int32(1)) // Int32(2)
+    processed_any = curr_mask_block_cnt + curr_full_block_cnt > Int32(0)
+
+    if const_expr(not intra_wg_overlap):
+        if curr_mask_block_cnt > 0:
+            warp_scheduler_barrier_sync()
+            kv_consumer_state = mma_one_n_block(
+                kv_consumer_state,
+                n_block=Int32(0),
+                mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
+                mask_fn=partial(
+                    pair_tail_mask_fn,
+                    col_limit=sparse_m64n128_col_limit(
+                        curr_mask_block_cnt, Int32(0), tile_n
+                    ),
+                ),
+                is_first_n_block=True,
+            )
+            O_should_accumulate = True
+            for pair_idx in cutlass.range(1, mask_pair_count, unroll=1):
+                kv_consumer_state = mma_one_n_block(
+                    kv_consumer_state,
+                    n_block=Int32(0),
+                    mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
+                    mask_fn=partial(
+                        pair_tail_mask_fn,
+                        col_limit=sparse_m64n128_col_limit(
+                            curr_mask_block_cnt, pair_idx, tile_n
+                        ),
+                    ),
+                    is_first_n_block=False,
+                )
+                O_should_accumulate = True
+        if curr_full_block_cnt > 0:
+            if curr_mask_block_cnt == 0:
+                warp_scheduler_barrier_sync()
+                kv_consumer_state = mma_one_n_block(
+                    kv_consumer_state,
+                    n_block=Int32(0),
+                    mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
+                    mask_fn=partial(
+                        pair_tail_mask_fn,
+                        col_limit=sparse_m64n128_col_limit(
+                            curr_full_block_cnt, Int32(0), tile_n
+                        ),
+                    ),
+                    is_first_n_block=True,
+                )
+                O_should_accumulate = True
+            else:
+                kv_consumer_state = mma_one_n_block(
+                    kv_consumer_state,
+                    n_block=Int32(0),
+                    mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
+                    mask_fn=partial(
+                        pair_tail_mask_fn,
+                        col_limit=sparse_m64n128_col_limit(
+                            curr_full_block_cnt, Int32(0), tile_n
+                        ),
+                    ),
+                    is_first_n_block=False,
+                )
+                O_should_accumulate = True
+            for pair_idx in cutlass.range(1, full_pair_count, unroll=1):
+                kv_consumer_state = mma_one_n_block(
+                    kv_consumer_state,
+                    n_block=Int32(0),
+                    mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
+                    mask_fn=None,
+                    is_first_n_block=False,
+                )
+                O_should_accumulate = True
+        if processed_any:
+            warp_scheduler_barrier_arrive()
+    else:
+        if curr_mask_block_cnt > 0:
+            kv_consumer_state = process_first_half_block(
+                n_block=Int32(0),
+                seqlen=seqlen,
+                kv_consumer_state=kv_consumer_state,
+                mask_fn=partial(
+                    pair_tail_mask_fn,
+                    col_limit=sparse_m64n128_col_limit(
+                        curr_mask_block_cnt, Int32(0), tile_n
+                    ),
+                ),
+                score_mod_fn=None,
+                is_first_block=True,
+            )
+            for pair_idx in cutlass.range(1, mask_pair_count, unroll=1):
+                kv_consumer_state = mma_one_n_block(
+                    kv_consumer_state,
+                    n_block=Int32(0),
+                    seqlen=seqlen,
+                    mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
+                    mask_fn=partial(
+                        pair_tail_mask_fn,
+                        col_limit=sparse_m64n128_col_limit(
+                            curr_mask_block_cnt, pair_idx, tile_n
+                        ),
+                    ),
+                )
+                O_should_accumulate = True
+        if curr_full_block_cnt > 0:
+            if curr_mask_block_cnt == 0:
+                kv_consumer_state = process_first_half_block(
+                    n_block=Int32(0),
+                    seqlen=seqlen,
+                    kv_consumer_state=kv_consumer_state,
+                    mask_fn=partial(
+                        pair_tail_mask_fn,
+                        col_limit=sparse_m64n128_col_limit(
+                            curr_full_block_cnt, Int32(0), tile_n
+                        ),
+                    ),
+                    score_mod_fn=None,
+                    is_first_block=True,
+                )
+            else:
+                kv_consumer_state = mma_one_n_block(
+                    kv_consumer_state,
+                    n_block=Int32(0),
+                    seqlen=seqlen,
+                    mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
+                    mask_fn=partial(
+                        pair_tail_mask_fn,
+                        col_limit=sparse_m64n128_col_limit(
+                            curr_full_block_cnt, Int32(0), tile_n
+                        ),
+                    ),
+                )
+                O_should_accumulate = True
+            for pair_idx in cutlass.range(1, full_pair_count, unroll=1):
+                kv_consumer_state = mma_one_n_block(
+                    kv_consumer_state,
+                    n_block=Int32(0),
+                    seqlen=seqlen,
+                    mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
+                    mask_fn=None,
+                )
+                O_should_accumulate = True
+        if processed_any:
             kv_consumer_state = process_last_half_block(
                 kv_consumer_state=kv_consumer_state,
                 zero_init=not O_should_accumulate,
@@ -1348,6 +1707,192 @@ def consume_block_sparse_mma_bwd_sm90(
     return consumer_state_Q, consumer_state_dO
 
 
+# =============================================================================
+# SM90 backward N64-metadata / N128-MMA chunking
+#
+# Backward sparse metadata is transposed: each N64 KV block has a list of Q
+# blocks.  Pairing two adjacent N64 KV blocks therefore requires iterating the
+# union of their Q lists.  A Q block present in only one list is still executed
+# as one N128 MMA tile, with the other N64 score half masked to -inf.  This is
+# the backward analogue of the forward sparse M64N128 chunked path, and avoids
+# reloading Q/dO when both source blocks select the same Q block.
+# =============================================================================
+
+
+@cute.jit
+def get_total_q_block_count_bwd_m64n128(
+    blocksparse_tensors: BlockSparseTensors,
+    batch_idx,
+    head_idx,
+    n_block,
+):
+    """Return a nonzero upper bound for the two N64 two-list union."""
+    q_cnt, _, full_cnt, _ = blocksparse_tensors
+    source_n0 = n_block * Int32(2)
+    source_n1 = source_n0 + Int32(1)
+    return (
+        q_cnt[batch_idx, head_idx, source_n0]
+        + q_cnt[batch_idx, head_idx, source_n1]
+        + full_cnt[batch_idx, head_idx, source_n0]
+        + full_cnt[batch_idx, head_idx, source_n1]
+    )
+
+
+@cute.jit
+def produce_block_sparse_q_loads_bwd_m64n128_sm90(
+    blocksparse_tensors: BlockSparseTensors,
+    batch_idx,
+    head_idx,
+    n_block,
+    producer_state_Q,
+    producer_state_dO,
+    pipeline_Q,
+    pipeline_dO,
+    load_K,
+    load_V,
+    load_Q,
+    load_dO,
+    load_LSE,
+    load_dPsum,
+    tma_copy_bytes_K,
+    tma_copy_bytes_V,
+    Q_stage_eq_dO_stage: cutlass.Constexpr,
+    m_block_max: int,
+):
+    """Load Q/dO once for a sorted four-way union of N64 sparse lists."""
+    q_cnt, q_idx, full_cnt, full_idx = blocksparse_tensors
+    source_n0 = n_block * Int32(2)
+    source_n1 = source_n0 + Int32(1)
+    kv_loaded = False
+    cq0 = q_cnt[batch_idx, head_idx, source_n0]
+    cq1 = q_cnt[batch_idx, head_idx, source_n1]
+    cf0 = full_cnt[batch_idx, head_idx, source_n0]
+    cf1 = full_cnt[batch_idx, head_idx, source_n1]
+    iq0 = q_idx[batch_idx, head_idx, source_n0, None]
+    iq1 = q_idx[batch_idx, head_idx, source_n1, None]
+    if0 = full_idx[batch_idx, head_idx, source_n0, None]
+    if1 = full_idx[batch_idx, head_idx, source_n1, None]
+    pq0, pq1, pf0, pf1 = Int32(0), Int32(0), Int32(0), Int32(0)
+    sentinel = Int32(0x7FFFFFFF)
+    while pq0 < cq0 or pq1 < cq1 or pf0 < cf0 or pf1 < cf1:
+        mq0, mq1, mf0, mf1 = sentinel, sentinel, sentinel, sentinel
+        if pq0 < cq0:
+            mq0 = iq0[pq0]
+        if pq1 < cq1:
+            mq1 = iq1[pq1]
+        if pf0 < cf0:
+            mf0 = if0[pf0]
+        if pf1 < cf1:
+            mf1 = if1[pf1]
+        m_block = min(mq0, mq1, mf0, mf1)
+        if m_block < m_block_max:
+            producer_state_Q, producer_state_dO = _load_q_do_block_sm90(
+                m_block, producer_state_Q, producer_state_dO, pipeline_Q, pipeline_dO,
+                load_K, load_V, load_Q, load_dO, load_LSE, load_dPsum,
+                tma_copy_bytes_K, tma_copy_bytes_V, Q_stage_eq_dO_stage,
+                load_kv=not kv_loaded,
+            )
+            kv_loaded = True
+        if mq0 == m_block:
+            pq0 = pq0 + Int32(1)
+        if mq1 == m_block:
+            pq1 = pq1 + Int32(1)
+        if mf0 == m_block:
+            pf0 = pf0 + Int32(1)
+        if mf1 == m_block:
+            pf1 = pf1 + Int32(1)
+    return producer_state_Q, producer_state_dO
+
+
+@cute.jit
+def sparse_bwd_m64n128_half_mask(
+    acc_S: cute.Tensor,
+    m_block,
+    thr_mma,
+    swap_AB: cutlass.Constexpr,
+    low_active,
+    high_active,
+):
+    """Mask either N64 half of an N128 backward score tile."""
+    acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S, transpose=swap_AB)
+    acc_shape = (64, 128)
+    cS = cute.make_identity_tensor(acc_shape if not swap_AB else acc_shape[::-1])
+    tScS_mn = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(cS), transpose=swap_AB)
+    t0ScS_mn = layout_utils.reshape_acc_to_mn(
+        thr_mma.get_slice(0).partition_C(cS), transpose=swap_AB
+    )
+    COL = 1 if const_expr(not swap_AB) else 0
+    thr_col_offset = tScS_mn[0][COL]
+    for c in cutlass.range(cute.size(tScS_mn.shape[1]), unroll_full=True):
+        col = thr_col_offset + t0ScS_mn[0, c][COL]
+        keep = low_active if col < Int32(64) else high_active
+        for r in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
+            acc_S_mn[r, c] = acc_S_mn[r, c] if keep else -Float32.inf
+
+
+@cute.jit
+def consume_block_sparse_mma_bwd_m64n128_sm90(
+    blocksparse_tensors: BlockSparseTensors,
+    batch_idx,
+    head_idx,
+    n_block,
+    consumer_state_Q,
+    consumer_state_dO,
+    mma_one_m_block_fn,
+    thr_mma_SdP,
+    swap_AB: cutlass.Constexpr,
+    m_block_max: int,
+):
+    """Consume a sorted four-way union as native N128 backward MMA tiles."""
+    q_cnt, q_idx, full_cnt, full_idx = blocksparse_tensors
+    source_n0 = n_block * Int32(2)
+    source_n1 = source_n0 + Int32(1)
+    dKV_accumulate = False
+    cq0 = q_cnt[batch_idx, head_idx, source_n0]
+    cq1 = q_cnt[batch_idx, head_idx, source_n1]
+    cf0 = full_cnt[batch_idx, head_idx, source_n0]
+    cf1 = full_cnt[batch_idx, head_idx, source_n1]
+    iq0 = q_idx[batch_idx, head_idx, source_n0, None]
+    iq1 = q_idx[batch_idx, head_idx, source_n1, None]
+    if0 = full_idx[batch_idx, head_idx, source_n0, None]
+    if1 = full_idx[batch_idx, head_idx, source_n1, None]
+    pq0, pq1, pf0, pf1 = Int32(0), Int32(0), Int32(0), Int32(0)
+    sentinel = Int32(0x7FFFFFFF)
+    while pq0 < cq0 or pq1 < cq1 or pf0 < cf0 or pf1 < cf1:
+        mq0, mq1, mf0, mf1 = sentinel, sentinel, sentinel, sentinel
+        if pq0 < cq0:
+            mq0 = iq0[pq0]
+        if pq1 < cq1:
+            mq1 = iq1[pq1]
+        if pf0 < cf0:
+            mf0 = if0[pf0]
+        if pf1 < cf1:
+            mf1 = if1[pf1]
+        m_block = min(mq0, mq1, mf0, mf1)
+        low_active = mq0 == m_block or mf0 == m_block
+        high_active = mq1 == m_block or mf1 == m_block
+        if m_block < m_block_max:
+            consumer_state_Q, consumer_state_dO = mma_one_m_block_fn(
+                m_block, consumer_state_Q, consumer_state_dO,
+                mask_fn=partial(
+                    sparse_bwd_m64n128_half_mask, thr_mma=thr_mma_SdP,
+                    swap_AB=swap_AB, low_active=low_active, high_active=high_active,
+                ),
+                score_mod_fn=None, score_mod_bwd_fn=None,
+                dKV_accumulate=dKV_accumulate,
+            )
+            dKV_accumulate = True
+        if mq0 == m_block:
+            pq0 = pq0 + Int32(1)
+        if mq1 == m_block:
+            pq1 = pq1 + Int32(1)
+        if mf0 == m_block:
+            pf0 = pf0 + Int32(1)
+        if mf1 == m_block:
+            pf1 = pf1 + Int32(1)
+    return consumer_state_Q, consumer_state_dO
+
+
 @cute.jit
 def _store_one_dQaccum_sm90(
     m_block,
@@ -1437,3 +1982,56 @@ def dQaccum_store_block_sparse_bwd_sm90(
                     num_threads_per_warp_group,
                     tma_copy_bytes_dQ,
                 )
+
+
+@cute.jit
+def dQaccum_store_block_sparse_bwd_m64n128_sm90(
+    blocksparse_tensors: BlockSparseTensors,
+    batch_idx,
+    head_idx,
+    n_block,
+    sdQaccum: cute.Tensor,
+    gdQaccum: cute.Tensor,
+    m_block_max: int,
+    num_dQ_warp_groups: cutlass.Constexpr,
+    num_threads_per_warp_group: cutlass.Constexpr,
+    tma_copy_bytes_dQ,
+):
+    """Store dQ contributions in the same sorted four-way union order."""
+    q_cnt, q_idx, full_cnt, full_idx = blocksparse_tensors
+    source_n0 = n_block * Int32(2)
+    source_n1 = source_n0 + Int32(1)
+    cq0 = q_cnt[batch_idx, head_idx, source_n0]
+    cq1 = q_cnt[batch_idx, head_idx, source_n1]
+    cf0 = full_cnt[batch_idx, head_idx, source_n0]
+    cf1 = full_cnt[batch_idx, head_idx, source_n1]
+    iq0 = q_idx[batch_idx, head_idx, source_n0, None]
+    iq1 = q_idx[batch_idx, head_idx, source_n1, None]
+    if0 = full_idx[batch_idx, head_idx, source_n0, None]
+    if1 = full_idx[batch_idx, head_idx, source_n1, None]
+    pq0, pq1, pf0, pf1 = Int32(0), Int32(0), Int32(0), Int32(0)
+    sentinel = Int32(0x7FFFFFFF)
+    while pq0 < cq0 or pq1 < cq1 or pf0 < cf0 or pf1 < cf1:
+        mq0, mq1, mf0, mf1 = sentinel, sentinel, sentinel, sentinel
+        if pq0 < cq0:
+            mq0 = iq0[pq0]
+        if pq1 < cq1:
+            mq1 = iq1[pq1]
+        if pf0 < cf0:
+            mf0 = if0[pf0]
+        if pf1 < cf1:
+            mf1 = if1[pf1]
+        m_block = min(mq0, mq1, mf0, mf1)
+        if m_block < m_block_max:
+            _store_one_dQaccum_sm90(
+                m_block, sdQaccum, gdQaccum, num_dQ_warp_groups,
+                num_threads_per_warp_group, tma_copy_bytes_dQ,
+            )
+        if mq0 == m_block:
+            pq0 = pq0 + Int32(1)
+        if mq1 == m_block:
+            pq1 = pq1 + Int32(1)
+        if mf0 == m_block:
+            pf0 = pf0 + Int32(1)
+        if mf1 == m_block:
+            pf1 = pf1 + Int32(1)

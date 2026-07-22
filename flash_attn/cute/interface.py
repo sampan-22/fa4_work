@@ -505,10 +505,62 @@ def _flash_attn_fwd(
     else:
         fwd_cfg = FwdConfig(tile_mn[0], tile_mn[1], fwd_cfg.mma_pv_is_rs, fwd_cfg.intra_wg_overlap)
     tile_m, tile_n = fwd_cfg.m_block_size, fwd_cfg.n_block_size
+    sparse_metadata_tile_n = tile_n
     if mma_pv_is_rs is None:
         mma_pv_is_rs = fwd_cfg.mma_pv_is_rs
     if intra_wg_overlap is None:
         intra_wg_overlap = fwd_cfg.intra_wg_overlap
+
+    chunked_env = os.environ.get("FLASH_ATTN_SM90_SPARSE_M64N128_CHUNKED_MMA", "0")
+    if chunked_env not in ("0", "1"):
+        raise ValueError(
+            "FLASH_ATTN_SM90_SPARSE_M64N128_CHUNKED_MMA must be 0 or 1"
+        )
+    # The flag is process-wide so benchmark/model code can opt in without
+    # plumbing another public API argument.  Dense attention in the same
+    # process must remain unaffected (the Ursa benchmark measures a dense
+    # reference before the sparse kernel).
+    sparse_m64n128_chunked_mma = chunked_env == "1" and use_block_sparsity
+    if sparse_m64n128_chunked_mma:
+        if arch // 10 != 9:
+            raise NotImplementedError("Sparse M64N128 chunked MMA is SM90-only")
+        if not use_block_sparsity:
+            raise ValueError("Sparse M64N128 chunked MMA requires block_sparse_tensors")
+        if tile_mn != (64, 64):
+            raise ValueError(
+                "Sparse M64N128 chunked MMA requires the API-visible tile_mn=(64, 64)"
+            )
+        if block_sparse_tensors.block_size != (64, 64):
+            raise ValueError(
+                "Sparse M64N128 chunked MMA requires N64 metadata with block_size=(64, 64)"
+            )
+        if q.dtype != torch.bfloat16 or head_dim != 128 or head_dim_v != 128:
+            raise NotImplementedError(
+                "Sparse M64N128 chunked MMA currently supports bf16 D=DV=128 only"
+            )
+        if causal or local or score_mod is not None or mask_mod is not None:
+            raise NotImplementedError(
+                "Sparse M64N128 chunked MMA does not support causal/local/score_mod/mask_mod"
+            )
+        if page_table is not None or learnable_sink is not None or qv is not None:
+            raise NotImplementedError(
+                "Sparse M64N128 chunked MMA does not support paged KV, sinks, or qv"
+            )
+        if any(x is not None for x in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)):
+            raise NotImplementedError("Sparse M64N128 chunked MMA requires fixed lengths")
+        if seqlen_q % 64 != 0 or seqlen_k % 64 != 0:
+            raise ValueError(
+                "Sparse M64N128 chunked MMA requires Q/K lengths divisible by the N64 source block"
+            )
+        if not mma_pv_is_rs:
+            raise NotImplementedError("Sparse M64N128 chunked MMA requires register-sourced PV")
+        if os.environ.get("FLASH_ATTN_SM90_FIXED_REF_SOFTMAX", "0") != "0":
+            raise ValueError(
+                "Fixed-reference softmax must remain disabled for the chunked-MMA experiment"
+            )
+        # The public sparse block and list coordinates remain N64.  Only the
+        # internal SMEM/score/P/WGMMA tile becomes N128.
+        tile_n = 128
 
     # TODO: fix GQA + SplitKV + non-varlen
     if pack_gqa and num_splits != 1 and cu_seqlens_q is None:
@@ -612,6 +664,10 @@ def _flash_attn_fwd(
         # NB: pack_gqa requires block sparse head dim == 1 (broadcasted)
         if pack_gqa and block_sparse_tensors.mask_block_cnt.shape[1] != 1:
             pack_gqa = False
+        if sparse_m64n128_chunked_mma and pack_gqa:
+            raise NotImplementedError(
+                "Sparse M64N128 chunked MMA does not yet support packed-GQA metadata"
+            )
         if is_split_kv:
             raise NotImplementedError(
                 "Block sparsity is not yet supported with SplitKV. TODO: partition sparse block lists per split."
@@ -634,7 +690,7 @@ def _flash_attn_fwd(
             num_head=num_head,
             seqlen_q=seqlen_q,
             seqlen_k=seqlen_k,
-            block_size=(tile_m, tile_n),
+            block_size=(tile_m, sparse_metadata_tile_n),
             q_stage=q_stage,
         )
     if aux_tensors is not None:
@@ -686,6 +742,14 @@ def _flash_attn_fwd(
     sm90_min_blocks = int(os.environ.get("FLASH_ATTN_SM90_MIN_BLOCKS", 1))
     if arch // 10 != 9:
         sm90_min_blocks = 1
+    if sm90_min_blocks not in (1, 2):
+        raise ValueError("FLASH_ATTN_SM90_MIN_BLOCKS must be 1 or 2")
+
+    # Two N128 K stages plus two V stages consume about 148 KiB/CTA and cannot
+    # physically co-reside on H100.  For the opt-in MIN_BLOCKS=2 experiment,
+    # use one K and one V stage (~83 KiB/CTA) and let the existing launch bound
+    # cap registers so two 256-thread CTAs can reside on an SM.
+    sm90_num_stages = 1 if sparse_m64n128_chunked_mma and sm90_min_blocks == 2 else 2
 
     compile_key = (
         dtype,
@@ -720,6 +784,7 @@ def _flash_attn_fwd(
         page_size not in [None, tile_n],  # paged KV non-TMA
         use_2cta_instrs,
         q_subtile_factor,
+        sparse_m64n128_chunked_mma,
         mma_pv_is_rs,
         intra_wg_overlap,
         sm90_min_blocks,
@@ -830,8 +895,7 @@ def _flash_attn_fwd(
                 pack_gqa=pack_gqa,
                 tile_m=tile_m,
                 tile_n=tile_n,
-                # num_stages=1,
-                num_stages=2,
+                num_stages=sm90_num_stages,
                 num_threads=num_threads,
                 Q_in_regs=False,
                 intra_wg_overlap=intra_wg_overlap,
@@ -842,6 +906,7 @@ def _flash_attn_fwd(
                 q_subtile_factor=q_subtile_factor,
                 paged_kv_non_tma=page_size not in [None, tile_n],
                 min_blocks_per_mp=sm90_min_blocks,
+                sparse_m64n128_chunked_mma=sparse_m64n128_chunked_mma,
             )
         elif arch // 10 in [10, 11]:
             if qv is not None:
@@ -1234,8 +1299,41 @@ def _flash_attn_bwd(
     arch = _get_device_arch()
     assert arch // 10 in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
     sparse_q = None
+    sparse_kv = None
     if block_sparse_tensors is not None and arch // 10 == 9:
-        sparse_q = block_sparse_tensors.block_size[0] if block_sparse_tensors.block_size is not None else 128
+        if block_sparse_tensors.block_size is not None:
+            sparse_q, sparse_kv = block_sparse_tensors.block_size
+        else:
+            sparse_q, sparse_kv = 128, 128
+    sparse_bwd_chunked_env = os.environ.get(
+        "FLASH_ATTN_SM90_SPARSE_BWD_M64N128_CHUNKED_MMA", "0"
+    )
+    if sparse_bwd_chunked_env not in ("0", "1"):
+        raise ValueError(
+            "FLASH_ATTN_SM90_SPARSE_BWD_M64N128_CHUNKED_MMA must be 0 or 1"
+        )
+    # Like the forward experiment, this is a process-wide opt-in.  Do not
+    # redirect unrelated dense backward calls made by the same model/bench.
+    sparse_bwd_m64n128_chunked_mma = (
+        sparse_bwd_chunked_env == "1" and block_sparse_tensors is not None
+    )
+    sparse_bwd_chunked_stages_env = os.environ.get(
+        "FLASH_ATTN_SM90_SPARSE_BWD_M64N128_STAGES", "2,2,2"
+    )
+    try:
+        sparse_bwd_chunked_stages = tuple(
+            int(stage) for stage in sparse_bwd_chunked_stages_env.split(",")
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "FLASH_ATTN_SM90_SPARSE_BWD_M64N128_STAGES must be Q,dO,PdS"
+        ) from exc
+    if len(sparse_bwd_chunked_stages) != 3 or any(
+        stage < 1 for stage in sparse_bwd_chunked_stages
+    ):
+        raise ValueError(
+            "FLASH_ATTN_SM90_SPARSE_BWD_M64N128_STAGES must contain three positive integers"
+        )
 
     num_head, head_dim = q.shape[-2:]
     head_dim_v = v.shape[-1]
@@ -1292,6 +1390,22 @@ def _flash_attn_bwd(
         dQ_single_wg = cfg.dQ_single_wg
         cluster_size = 1
         use_2cta_instrs = False
+        if block_sparse_tensors is not None and sparse_kv == 64:
+            # The baseline follows the physical N64 cube.  The opt-in path
+            # retains N64 metadata but schedules adjacent cubes as one N128
+            # work tile and one set of native N128 MMAs.
+            n_block_size = 128 if sparse_bwd_m64n128_chunked_mma else 64
+            if not sparse_bwd_m64n128_chunked_mma:
+                AtomLayoutNdKV = 1
+        if sparse_bwd_m64n128_chunked_mma:
+            num_stages_Q, num_stages_dO, num_stages_PdS = sparse_bwd_chunked_stages
+            if num_stages_dO not in (1, num_stages_Q) or num_stages_PdS not in (
+                1,
+                num_stages_Q,
+            ):
+                raise ValueError(
+                    "Chunked SM90 backward requires dO/PdS stages to be either 1 or Q stages"
+                )
         is_varlen = (
             cu_seqlens_q is not None
             or cu_seqlens_k is not None
@@ -1340,6 +1454,36 @@ def _flash_attn_bwd(
         seqlen_k = max_seqlen_k if max_seqlen_k is not None else total_k
 
     num_head_kv = k.shape[-2]
+
+    if sparse_bwd_m64n128_chunked_mma:
+        if not (
+            arch // 10 == 9
+            and block_sparse_tensors is not None
+            and sparse_q == 64
+            and sparse_kv == 64
+            and head_dim == 128
+            and head_dim_v == 128
+            and m_block_size == 64
+            and n_block_size == 128
+            and not causal
+            and not local
+            and not deterministic
+            and cu_seqlens_q is None
+            and cu_seqlens_k is None
+            and seqused_q is None
+            and seqused_k is None
+            and score_mod is None
+            and score_mod_bwd is None
+            and mask_mod is None
+            and aux_tensors is None
+            and seqlen_q % 64 == 0
+            and seqlen_k % 128 == 0
+        ):
+            raise ValueError(
+                "SM90 sparse backward M64N128 chunking requires fixed-length, "
+                "noncausal/nonlocal bf16/fp16 D=DV=128, N64 block-sparse metadata, "
+                "sequence lengths divisible by (64, 128), and no score/mask mods"
+            )
 
     use_block_sparsity = block_sparse_tensors is not None
     subtile_factor = sparse_q // m_block_size if sparse_q is not None else 2
@@ -1555,7 +1699,7 @@ def _flash_attn_bwd(
             num_head=num_head,
             seqlen_q=seqlen_q,
             seqlen_k=seqlen_k,
-            block_size=(m_block_size, n_block_size),
+            block_size=(m_block_size, sparse_kv if sparse_kv is not None else n_block_size),
             subtile_factor=subtile_factor,
         )
 
@@ -1575,6 +1719,7 @@ def _flash_attn_bwd(
             pack_gqa,
             num_stages_Q,
             num_stages_dO,
+            num_stages_PdS,
             SdP_swapAB,
             dKV_swapAB,
             dQ_swapAB,
@@ -1583,6 +1728,7 @@ def _flash_attn_bwd(
             AtomLayoutMdQ,
             V_in_regs,
             dQ_single_wg,
+            sparse_bwd_m64n128_chunked_mma,
             deterministic,
             cu_seqlens_q is None,
             cu_seqlens_k is None,
@@ -1637,6 +1783,25 @@ def _flash_attn_bwd(
             (seqlen_q_rounded // m_block_size == 1),
             (seqlen_k_rounded // n_block_size == 1),
         )
+
+    if (
+        sparse_bwd_m64n128_chunked_mma
+        and compile_key not in _flash_attn_bwd.compile_cache
+    ):
+        if block_sparse_tensors.full_block_cnt is None:
+            raise ValueError("Sparse backward M64N128 chunking requires full-block lists")
+        for list_name, cnt, idx in (
+            ("partial", block_sparse_tensors.mask_block_cnt, block_sparse_tensors.mask_block_idx),
+            ("full", block_sparse_tensors.full_block_cnt, block_sparse_tensors.full_block_idx),
+        ):
+            if idx.shape[-1] > 1:
+                valid_pair = torch.arange(idx.shape[-1] - 1, device=idx.device) < (
+                    cnt[..., None] - 1
+                )
+                if torch.any((idx[..., 1:] < idx[..., :-1]) & valid_pair).item():
+                    raise ValueError(
+                        f"Sparse backward M64N128 chunking requires sorted {list_name}-block indices"
+                    )
 
     if compile_key not in _flash_attn_bwd.compile_cache:
         q_tensor, k_tensor, v_tensor, do_tensor, dq_tensor, dk_tensor, dv_tensor = [
@@ -1709,6 +1874,7 @@ def _flash_attn_bwd(
                 has_aux_tensors=aux_tensors is not None,
                 subtile_factor=subtile_factor,
                 dQ_single_wg=dQ_single_wg,
+                sparse_bwd_m64n128_chunked_mma=sparse_bwd_m64n128_chunked_mma,
             )
         else:
             if use_dedicated_hd256_kernel:

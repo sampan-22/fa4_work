@@ -36,9 +36,13 @@ from flash_attn.cute.softmax import apply_score_mod_inner, apply_score_mod_bwd_i
 from flash_attn.cute.block_sparsity import BlockSparseTensors
 from flash_attn.cute.block_sparse_utils import (
     get_total_q_block_count_bwd,
+    get_total_q_block_count_bwd_m64n128,
     produce_block_sparse_q_loads_bwd_sm90,
+    produce_block_sparse_q_loads_bwd_m64n128_sm90,
     consume_block_sparse_mma_bwd_sm90,
+    consume_block_sparse_mma_bwd_m64n128_sm90,
     dQaccum_store_block_sparse_bwd_sm90,
+    dQaccum_store_block_sparse_bwd_m64n128_sm90,
 )
 
 
@@ -73,6 +77,7 @@ class FlashAttentionBackwardSm90:
         has_aux_tensors: cutlass.Constexpr = False,
         subtile_factor: cutlass.Constexpr[int] = 1,
         dQ_single_wg: bool = False,
+        sparse_bwd_m64n128_chunked_mma: bool = False,
     ):
         self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
@@ -129,6 +134,15 @@ class FlashAttentionBackwardSm90:
         self.mask_mod = mask_mod
         self.has_aux_tensors = has_aux_tensors
         self.subtile_factor = subtile_factor
+        self.sparse_bwd_m64n128_chunked_mma = sparse_bwd_m64n128_chunked_mma
+        if self.sparse_bwd_m64n128_chunked_mma:
+            assert self.tile_m == 64 and self.tile_n == 128
+            assert self.tile_hdim == 128 and self.tile_hdimv == 128
+            assert self.dtype.width == 16
+            assert self.subtile_factor == 1
+            assert not self.is_causal and not self.is_local
+            assert self.score_mod is None and self.score_mod_bwd is None
+            assert self.mask_mod is None and not self.has_aux_tensors
         if cutlass.const_expr(has_aux_tensors):
             self.vec_size: cutlass.Constexpr = 1
         else:
@@ -431,6 +445,12 @@ class FlashAttentionBackwardSm90:
 
         self._setup_attributes()
         SharedStorage = self._get_shared_storage_cls()
+        # H100 permits at most 227 KiB of opt-in shared memory per CTA.
+        # Keep stage experiments from compiling a kernel that cannot launch.
+        assert SharedStorage.size_in_bytes() <= 227 * 1024, (
+            "SM90 backward shared storage exceeds 227 KiB: "
+            f"{SharedStorage.size_in_bytes()} bytes"
+        )
 
         self.tma_copy_bytes = {
             name: cute.size_in_bytes(mX.element_type, cute.select(layout, mode=[0, 1]))
@@ -920,14 +940,19 @@ class FlashAttentionBackwardSm90:
                         or m_block_min < m_block_max
                     )
                 else:
-                    total_m_block_cnt = get_total_q_block_count_bwd(
-                        blocksparse_tensors,
-                        batch_idx,
-                        head_idx,
-                        n_block,
-                        subtile_factor=self.subtile_factor,
-                        m_block_max=m_block_max,
-                    )
+                    if const_expr(self.sparse_bwd_m64n128_chunked_mma):
+                        total_m_block_cnt = get_total_q_block_count_bwd_m64n128(
+                            blocksparse_tensors, batch_idx, head_idx, n_block
+                        )
+                    else:
+                        total_m_block_cnt = get_total_q_block_count_bwd(
+                            blocksparse_tensors,
+                            batch_idx,
+                            head_idx,
+                            n_block,
+                            subtile_factor=self.subtile_factor,
+                            m_block_max=m_block_max,
+                        )
                     process_tile = total_m_block_cnt > Int32(0)
 
                 if process_tile:
@@ -969,6 +994,29 @@ class FlashAttentionBackwardSm90:
                             load_dPsum(m_block, producer_state=producer_state_dO_cur)
                             producer_state_Q.advance()
                             producer_state_dO.advance()
+                    elif const_expr(self.sparse_bwd_m64n128_chunked_mma):
+                        producer_state_Q, producer_state_dO = (
+                            produce_block_sparse_q_loads_bwd_m64n128_sm90(
+                                blocksparse_tensors,
+                                batch_idx,
+                                head_idx,
+                                n_block,
+                                producer_state_Q,
+                                producer_state_dO,
+                                pipeline_Q,
+                                pipeline_dO,
+                                load_K,
+                                load_V,
+                                load_Q,
+                                load_dO,
+                                load_LSE,
+                                load_dPsum,
+                                self.tma_copy_bytes["K"],
+                                self.tma_copy_bytes["V"],
+                                Q_stage_eq_dO_stage=(self.Q_stage == self.dO_stage),
+                                m_block_max=m_block_max,
+                            )
+                        )
                     else:
                         producer_state_Q, producer_state_dO = produce_block_sparse_q_loads_bwd_sm90(
                             blocksparse_tensors,
@@ -1310,14 +1358,19 @@ class FlashAttentionBackwardSm90:
                     or m_block_min < m_block_max
                 )
             else:
-                total_m_block_cnt = get_total_q_block_count_bwd(
-                    blocksparse_tensors,
-                    batch_idx,
-                    head_idx,
-                    n_block,
-                    subtile_factor=self.subtile_factor,
-                    m_block_max=m_block_max,
-                )
+                if const_expr(self.sparse_bwd_m64n128_chunked_mma):
+                    total_m_block_cnt = get_total_q_block_count_bwd_m64n128(
+                        blocksparse_tensors, batch_idx, head_idx, n_block
+                    )
+                else:
+                    total_m_block_cnt = get_total_q_block_count_bwd(
+                        blocksparse_tensors,
+                        batch_idx,
+                        head_idx,
+                        n_block,
+                        subtile_factor=self.subtile_factor,
+                        m_block_max=m_block_max,
+                    )
                 process_tile = total_m_block_cnt > Int32(0)
 
             if process_tile:
@@ -1347,6 +1400,21 @@ class FlashAttentionBackwardSm90:
                             dKV_accumulate=dKV_accumulate,
                         )
                         dKV_accumulate = True
+                elif const_expr(self.sparse_bwd_m64n128_chunked_mma):
+                    consumer_state_Q, consumer_state_dO = (
+                        consume_block_sparse_mma_bwd_m64n128_sm90(
+                            blocksparse_tensors,
+                            batch_idx,
+                            head_idx,
+                            n_block,
+                            consumer_state_Q,
+                            consumer_state_dO,
+                            mma_one_m_block_all,
+                            thr_mma_SdP,
+                            swap_AB=self.SdP_swapAB,
+                            m_block_max=m_block_max,
+                        )
+                    )
                 else:
                     consumer_state_Q, consumer_state_dO = consume_block_sparse_mma_bwd_sm90(
                         blocksparse_tensors,
@@ -1779,14 +1847,19 @@ class FlashAttentionBackwardSm90:
                 )
                 loop_count = m_block_max - m_block_min
             else:
-                total_block_cnt = get_total_q_block_count_bwd(
-                    blocksparse_tensors,
-                    batch_idx,
-                    head_idx,
-                    n_block,
-                    subtile_factor=self.subtile_factor,
-                    m_block_max=m_block_max,
-                )
+                if const_expr(self.sparse_bwd_m64n128_chunked_mma):
+                    total_block_cnt = get_total_q_block_count_bwd_m64n128(
+                        blocksparse_tensors, batch_idx, head_idx, n_block
+                    )
+                else:
+                    total_block_cnt = get_total_q_block_count_bwd(
+                        blocksparse_tensors,
+                        batch_idx,
+                        head_idx,
+                        n_block,
+                        subtile_factor=self.subtile_factor,
+                        m_block_max=m_block_max,
+                    )
                 process_tile = total_block_cnt > Int32(0)
 
             if process_tile:
@@ -1851,19 +1924,33 @@ class FlashAttentionBackwardSm90:
                     assert not self.deterministic, (
                         "Deterministic not implemented for block-sparse backward"
                     )
-                    dQaccum_store_block_sparse_bwd_sm90(
-                        blocksparse_tensors,
-                        batch_idx,
-                        head_idx,
-                        n_block,
-                        sdQaccum,
-                        gdQaccum,
-                        subtile_factor=self.subtile_factor,
-                        m_block_max=m_block_max,
-                        num_dQ_warp_groups=self.num_wg_dQ,
-                        num_threads_per_warp_group=self.num_threads_per_warp_group,
-                        tma_copy_bytes_dQ=self.tma_copy_bytes["dQ"],
-                    )
+                    if const_expr(self.sparse_bwd_m64n128_chunked_mma):
+                        dQaccum_store_block_sparse_bwd_m64n128_sm90(
+                            blocksparse_tensors,
+                            batch_idx,
+                            head_idx,
+                            n_block,
+                            sdQaccum,
+                            gdQaccum,
+                            m_block_max=m_block_max,
+                            num_dQ_warp_groups=self.num_wg_dQ,
+                            num_threads_per_warp_group=self.num_threads_per_warp_group,
+                            tma_copy_bytes_dQ=self.tma_copy_bytes["dQ"],
+                        )
+                    else:
+                        dQaccum_store_block_sparse_bwd_sm90(
+                            blocksparse_tensors,
+                            batch_idx,
+                            head_idx,
+                            n_block,
+                            sdQaccum,
+                            gdQaccum,
+                            subtile_factor=self.subtile_factor,
+                            m_block_max=m_block_max,
+                            num_dQ_warp_groups=self.num_wg_dQ,
+                            num_threads_per_warp_group=self.num_threads_per_warp_group,
+                            tma_copy_bytes_dQ=self.tma_copy_bytes["dQ"],
+                        )
 
             # For local masking + deterministic (non-spt): signal remaining m_blocks
             # that this n_block won't visit, so they don't deadlock waiting.
