@@ -122,7 +122,7 @@ def main():
         for label, min_blocks, dual_tile, kv_pair, stages in [
             ("1cta", 1, False, "0", "2"),
             ("2cta", 2, False, "0", "2"),
-            ("optimized", 1, False, "auto", "auto"),
+            ("optimized", 1, "auto", "auto", "auto"),
         ]:
             ms = time_kernel(
                 q,

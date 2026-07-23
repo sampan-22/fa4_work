@@ -6,7 +6,7 @@ in chunks and stored at their actual ``topk`` width.  This keeps the 256k and
 512k cases practical without changing the kernel workload.
 
 Usage:
-    python -u bench_long_context.py [128k,256k,512k]
+    python -u bench_long_context.py [16k,32k,64k,128k,256k,512k]
 
 Environment:
     BENCH_TRIALS   Per-configuration timing trials (default: 3)
@@ -31,6 +31,9 @@ HEADS = 8
 PEAK = 990e12
 
 SIZES = {
+    "16k": (264, 33),
+    "32k": (528, 66),
+    "64k": (1056, 132),
     "128k": (2160, 270),
     "256k": (4320, 540),
     "512k": (8640, 1080),
@@ -39,13 +42,19 @@ SIZES = {
 CONFIGS = (
     ("1cta", 1, "0", "2", 64, "0"),
     ("2cta", 2, "0", "2", 64, "0"),
-    ("optimized", 1, "0", "auto", 64, "auto"),
+    ("optimized", 1, "auto", "auto", 64, "auto"),
 )
 if os.environ.get("BENCH_KV_PAIR", "0") == "1":
     pair_stages = os.environ.get("BENCH_PAIR_STAGES", "2")
     CONFIGS = (
         ("1cta", 1, "0", "2", 64, "0"),
         ("paired", 1, "0", pair_stages, 128, "1"),
+    )
+if os.environ.get("BENCH_SHORT_SWEEP", "0") == "1":
+    CONFIGS = (
+        ("1cta", 1, "0", "2", 64, "0"),
+        ("2cta", 2, "0", "2", 64, "0"),
+        ("paired", 1, "0", "2", 128, "1"),
     )
 
 

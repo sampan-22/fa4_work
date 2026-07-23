@@ -497,7 +497,7 @@ def _flash_attn_fwd(
         and head_dim % 64 == 0
         and head_dim_v % 64 == 0
         and q.element_size() == 2
-        and os.environ.get("FLASH_ATTN_SM90_DUAL_TILE", "0").lower() != "1"
+        and os.environ.get("FLASH_ATTN_SM90_DUAL_TILE", "auto").lower() != "1"
         and block_sparse_tensors.block_size == (64, 64)
     )
     if sm90_kv_pair_eligible:
@@ -743,7 +743,7 @@ def _flash_attn_fwd(
     # 2 CTAs/SM occupancy config (256-thread SM90 kernel only): env-driven,
     # must be in the compile key or changing the env between calls would
     # silently hit a stale kernel.
-    sm90_dual_setting = os.environ.get("FLASH_ATTN_SM90_DUAL_TILE", "0").lower()
+    sm90_dual_setting = os.environ.get("FLASH_ATTN_SM90_DUAL_TILE", "auto").lower()
     if sm90_dual_setting == "auto":
         # Two CTAs win while the random K/V working set is cache-hot. Once the
         # working set exceeds L2, the unrestricted one-CTA kernel wins. Sparse
