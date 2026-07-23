@@ -333,13 +333,31 @@ def normalize_block_sparse_config(
     seqlen_k: int,
     block_size: tuple[int, int],
     q_stage: int,
-) -> tuple[BlockSparseTensorsTorch, Tuple[Tuple[bool, ...], ...] | None, int]:
+    allow_kv_pairing: bool = False,
+) -> tuple[
+    BlockSparseTensorsTorch,
+    Tuple[Tuple[bool, ...], ...] | None,
+    int,
+    int,
+]:
+    """Validate and normalize block sparsity, optionally pairing two KV blocks."""
     m_block_size, n_block_size = block_size
     if tensors.block_size is None:
         sparse_block_size_q, sparse_block_size_kv = None, n_block_size
     else:
         sparse_block_size_q, sparse_block_size_kv = tensors.block_size
-    if sparse_block_size_kv != n_block_size:
+    kv_pair_factor = 1
+    if (
+        allow_kv_pairing
+        and sparse_block_size_kv < n_block_size
+        and n_block_size % sparse_block_size_kv == 0
+    ):
+        kv_pair_factor = n_block_size // sparse_block_size_kv
+        if kv_pair_factor != 2:
+            raise ValueError(
+                "KV pairing requires tile_n == 2 * sparse_block_size[1]"
+            )
+    elif sparse_block_size_kv != n_block_size:
         raise ValueError(
             f"Block sparsity requires sparse_block_size[1]={n_block_size} to match tile_n."
         )
@@ -351,7 +369,7 @@ def normalize_block_sparse_config(
             seqlen_q=seqlen_q,
             seqlen_k=seqlen_k,
             m_block_size=m_block_size,
-            n_block_size=n_block_size,
+            n_block_size=n_block_size // kv_pair_factor,
             q_stage=q_stage,
             context="forward",
             sparse_block_size_q=sparse_block_size_q,
@@ -367,6 +385,7 @@ def normalize_block_sparse_config(
         normalized_tensors,
         get_block_sparse_broadcast_pattern(normalized_tensors),
         q_subtile_factor,
+        kv_pair_factor,
     )
 
 

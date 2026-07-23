@@ -336,13 +336,15 @@ class FlashAttentionForwardBase:
         m_block: Int32,
         head_idx: Int32,
         batch_idx: Int32,
+        barrier_id: int = int(NamedBarrierFwd.Epilogue),
+        tma_store_warp_idx: int = 4,
     ):
         # store acc_O
         rO = cute.make_fragment_like(acc_O, self.dtype)
         rO.store(acc_O.load().to(self.dtype))
         # Make sure all threads have finished reading V
         cute.arch.barrier(
-            barrier_id=int(NamedBarrierFwd.Epilogue), number_of_threads=self.num_epilogue_threads
+            barrier_id=barrier_id, number_of_threads=self.num_epilogue_threads
         )
         smem_copy_atom_O = utils.get_smem_store_atom(self.arch.major * 10 + self.arch.minor, self.dtype)
         smem_thr_copy_O = cute.make_tiled_copy_C(smem_copy_atom_O, tiled_mma).get_slice(tidx)
@@ -392,7 +394,7 @@ class FlashAttentionForwardBase:
             # ensure smem writes are visible to TMA
             cute.arch.fence_view_async_shared()
             cute.arch.barrier_arrive(
-                barrier_id=int(NamedBarrierFwd.Epilogue),
+                barrier_id=barrier_id,
                 number_of_threads=self.num_epilogue_threads + cute.arch.WARP_SIZE,
             )
             gO = cute.local_tile(mO_cur, (self.tile_m, self.tile_hdimv), (m_block, 0))
@@ -400,9 +402,9 @@ class FlashAttentionForwardBase:
                 tma_atom_O, 0, cute.make_layout(1), sO, gO, single_stage=True
             )
             warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-            if warp_idx == 4:
+            if warp_idx == tma_store_warp_idx:
                 cute.arch.barrier(
-                    barrier_id=int(NamedBarrierFwd.Epilogue),
+                    barrier_id=barrier_id,
                     number_of_threads=self.num_epilogue_threads + cute.arch.WARP_SIZE,
                 )
                 store_O()
@@ -410,7 +412,7 @@ class FlashAttentionForwardBase:
                 cute.arch.cp_async_bulk_wait_group(0, read=True)
         else:
             cute.arch.barrier(
-                barrier_id=int(NamedBarrierFwd.Epilogue),
+                barrier_id=barrier_id,
                 number_of_threads=self.num_epilogue_threads,
             )
             gmem_thr_copy_O = gmem_tiled_copy_O.get_slice(tidx)
