@@ -1,4 +1,4 @@
-"""Long-context SM90 VSA benchmark: 1 CTA, 2 CTA, dual-query, and auto.
+"""Long-context SM90 VSA benchmark: 1 CTA, 2 CTA, and auto.
 
 The sparse selections have the same distribution as ``bench_min_blocks.py``
 (uniform sampling without replacement, sorted by block index), but are built
@@ -40,21 +40,21 @@ SIZES = {
 }
 
 CONFIGS = (
-    ("1cta", 1, "0", "2", 64, "0"),
-    ("2cta", 2, "0", "2", 64, "0"),
-    ("optimized", 1, "auto", "auto", 64, "auto"),
+    ("1cta", 1, "2", 64, "0"),
+    ("2cta", 2, "2", 64, "0"),
+    ("optimized", "auto", "auto", 64, "auto"),
 )
 if os.environ.get("BENCH_KV_PAIR", "0") == "1":
     pair_stages = os.environ.get("BENCH_PAIR_STAGES", "2")
     CONFIGS = (
-        ("1cta", 1, "0", "2", 64, "0"),
-        ("paired", 1, "0", pair_stages, 128, "1"),
+        ("1cta", 1, "2", 64, "0"),
+        ("paired", 1, pair_stages, 128, "1"),
     )
 if os.environ.get("BENCH_SHORT_SWEEP", "0") == "1":
     CONFIGS = (
-        ("1cta", 1, "0", "2", 64, "0"),
-        ("2cta", 2, "0", "2", 64, "0"),
-        ("paired", 1, "0", "2", 128, "1"),
+        ("1cta", 1, "2", 64, "0"),
+        ("2cta", 2, "2", 64, "0"),
+        ("paired", 1, "2", 128, "1"),
     )
 
 
@@ -108,15 +108,12 @@ def make_inputs(nkv: int, topk: int, seed: int = 0):
 
 def set_config(
     min_blocks: int,
-    dual_mode: str,
     stages: str,
     kv_pair: str,
 ):
     os.environ.update(
         FLASH_ATTN_SM90_MIN_BLOCKS=str(min_blocks),
-        FLASH_ATTN_SM90_DUAL_TILE=dual_mode,
         FLASH_ATTN_SM90_NUM_STAGES=stages,
-        FLASH_ATTN_SM90_DUAL_SCHEDULER_BARRIER="0",
         FLASH_ATTN_SM90_KV_PAIR=kv_pair,
     )
     os.environ.pop("FLASH_ATTN_SM90_MMA_REGS", None)
@@ -175,12 +172,11 @@ def main():
         for (
             label,
             min_blocks,
-            dual_mode,
             stages,
             tile_n,
             kv_pair,
         ) in CONFIGS:
-            set_config(min_blocks, dual_mode, stages, kv_pair)
+            set_config(min_blocks, stages, kv_pair)
             time_trial(q, k, v, sparse, tile_n, warmup=warmup, repeats=1)
         samples = {label: [] for label, *_ in CONFIGS}
         # Alternate the order to reduce bias from clock or temperature drift.
@@ -189,12 +185,11 @@ def main():
             for (
                 label,
                 min_blocks,
-                dual_mode,
                 stages,
                 tile_n,
                 kv_pair,
             ) in configs:
-                set_config(min_blocks, dual_mode, stages, kv_pair)
+                set_config(min_blocks, stages, kv_pair)
                 samples[label].append(
                     time_trial(
                         q, k, v, sparse, tile_n, warmup=warmup, repeats=repeats

@@ -251,7 +251,6 @@ torch2cute_dtype_map = {
 }
 
 
-_sm90_dual_uniform_count_cache: dict[tuple, bool] = {}
 _sm90_kv_pair_empty_mask_cache: dict[tuple, bool] = {}
 
 
@@ -497,7 +496,6 @@ def _flash_attn_fwd(
         and head_dim % 64 == 0
         and head_dim_v % 64 == 0
         and q.element_size() == 2
-        and os.environ.get("FLASH_ATTN_SM90_DUAL_TILE", "auto").lower() != "1"
         and block_sparse_tensors.block_size == (64, 64)
     )
     if sm90_kv_pair_eligible:
@@ -517,7 +515,7 @@ def _flash_attn_fwd(
         raise ValueError(
             "SM90 KV pairing requires noncausal full-block-only sparsity, "
             "64-aligned sequence/head dimensions, 16-bit inputs, "
-            "block_size=(64, 64), and dual-query mode disabled"
+            "block_size=(64, 64)"
         )
     sm90_kv_pair = sm90_kv_pair_eligible and (
         sm90_kv_pair_setting == "1"
@@ -740,23 +738,18 @@ def _flash_attn_fwd(
         sparse_kv = None
         disable_sparse_kv_bitmask = None
 
-    # 2 CTAs/SM occupancy config (256-thread SM90 kernel only): env-driven,
-    # must be in the compile key or changing the env between calls would
-    # silently hit a stale kernel.
-    sm90_dual_setting = os.environ.get("FLASH_ATTN_SM90_DUAL_TILE", "auto").lower()
-    if sm90_dual_setting == "auto":
-        # Two CTAs win while the random K/V working set is cache-hot. Once the
-        # working set exceeds L2, the unrestricted one-CTA kernel wins. Sparse
-        # query rows generally select different K/V blocks, so pairing two rows
-        # in one CTA does not provide the reuse of NVIDIA's dense FMHA kernel.
-        sm90_dual_tile = False
-    elif sm90_dual_setting in ("0", "1"):
-        sm90_dual_tile = sm90_dual_setting == "1"
-    else:
-        raise ValueError("FLASH_ATTN_SM90_DUAL_TILE must be 0, 1, or auto")
-    sm90_min_blocks = int(os.environ.get("FLASH_ATTN_SM90_MIN_BLOCKS", 1))
-    if sm90_dual_setting == "auto":
+    # 2-CTA/SM occupancy config for the ordinary 256-thread SM90 kernel.
+    # Random K/V access stays cache-hot below 96K; at longer lengths, use the
+    # unrestricted CTA (or the paired-KV specialization above).
+    sm90_min_blocks_setting = os.environ.get(
+        "FLASH_ATTN_SM90_MIN_BLOCKS", "auto"
+    ).lower()
+    if sm90_min_blocks_setting == "auto":
         sm90_min_blocks = 2 if use_block_sparsity and seqlen_k < 1_500 * 64 else 1
+    elif sm90_min_blocks_setting in ("1", "2"):
+        sm90_min_blocks = int(sm90_min_blocks_setting)
+    else:
+        raise ValueError("FLASH_ATTN_SM90_MIN_BLOCKS must be 1, 2, or auto")
     sm90_num_stages_setting = os.environ.get(
         "FLASH_ATTN_SM90_NUM_STAGES", "auto"
     ).lower()
@@ -769,60 +762,12 @@ def _flash_attn_fwd(
         )
     else:
         sm90_num_stages = int(sm90_num_stages_setting)
-    sm90_dual_scheduler_barrier = bool(
-        int(os.environ.get("FLASH_ATTN_SM90_DUAL_SCHEDULER_BARRIER", 0))
-    )
-    sm90_mma_regs_env = os.environ.get("FLASH_ATTN_SM90_MMA_REGS")
-    sm90_producer_regs_env = os.environ.get("FLASH_ATTN_SM90_PRODUCER_REGS")
-    sm90_mma_regs = int(sm90_mma_regs_env) if sm90_mma_regs_env is not None else None
-    sm90_producer_regs = (
-        int(sm90_producer_regs_env) if sm90_producer_regs_env is not None else None
-    )
-    sm90_tile_pairing = os.environ.get("FLASH_ATTN_SM90_TILE_PAIRING", "adjacent_sparse")
     if arch // 10 != 9:
-        sm90_dual_tile = False
         sm90_min_blocks = 1
         sm90_num_stages = 1
-        sm90_dual_scheduler_barrier = False
-        sm90_mma_regs = None
-        sm90_producer_regs = None
-        sm90_tile_pairing = "none"
     else:
         if sm90_num_stages not in (1, 2, 3):
             raise ValueError("FLASH_ATTN_SM90_NUM_STAGES must be 1, 2, or 3")
-        if sm90_tile_pairing != "adjacent_sparse":
-            raise ValueError("unsupported SM90 tile-pairing strategy")
-        if sm90_dual_tile:
-            if not use_block_sparsity or normalized_block_sparse_tensors is None:
-                raise ValueError("FLASH_ATTN_SM90_DUAL_TILE requires block sparsity")
-            full_count = normalized_block_sparse_tensors.full_block_cnt
-            if full_count is None:
-                raise ValueError("SM90 dual-tile mode requires full_block_cnt")
-            mask_count = normalized_block_sparse_tensors.mask_block_cnt
-            count_key = (
-                full_count.device,
-                full_count.data_ptr(),
-                full_count._version,
-                tuple(full_count.shape),
-                mask_count.data_ptr(),
-                mask_count._version,
-            )
-            if count_key not in _sm90_dual_uniform_count_cache:
-                count_min, count_max = torch.aminmax(full_count)
-                total_min, total_max = torch.aminmax(mask_count + full_count)
-                _sm90_dual_uniform_count_cache[count_key] = (
-                    count_min.item() == count_max.item()
-                    and total_min.item() == total_max.item()
-                )
-            if not _sm90_dual_uniform_count_cache[count_key]:
-                if sm90_dual_setting == "auto":
-                    # Preserve correctness for ragged sparse rows. The dual
-                    # stream's cross-WG protocol assumes equal trip counts.
-                    sm90_dual_tile = False
-                else:
-                    raise ValueError(
-                        "SM90 dual-tile mode requires uniform sparse block counts"
-                    )
 
     compile_key = (
         dtype,
@@ -862,11 +807,6 @@ def _flash_attn_fwd(
         intra_wg_overlap,
         sm90_min_blocks,
         sm90_num_stages,
-        sm90_dual_tile,
-        sm90_dual_scheduler_barrier,
-        sm90_mma_regs,
-        sm90_producer_regs,
-        sm90_tile_pairing,
         use_clc_scheduler,
         qv is not None,
         gather_kv_length,
@@ -986,10 +926,6 @@ def _flash_attn_fwd(
                 kv_pair_factor=kv_pair_factor,
                 paged_kv_non_tma=page_size not in [None, tile_n],
                 min_blocks_per_mp=sm90_min_blocks,
-                dual_tile=sm90_dual_tile,
-                dual_tile_scheduler_barrier=sm90_dual_scheduler_barrier,
-                mma_regs=sm90_mma_regs if sm90_dual_tile else None,
-                producer_regs=sm90_producer_regs if sm90_dual_tile else None,
             )
         elif arch // 10 in [10, 11]:
             if qv is not None:

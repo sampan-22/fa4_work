@@ -74,16 +74,12 @@ def time_kernel(
     v,
     bs,
     min_blocks,
-    dual_tile=False,
     kv_pair="0",
     stages="2",
     warmup=10,
     rep=50,
 ):
     os.environ["FLASH_ATTN_SM90_MIN_BLOCKS"] = str(min_blocks)
-    os.environ["FLASH_ATTN_SM90_DUAL_TILE"] = (
-        dual_tile if isinstance(dual_tile, str) else "1" if dual_tile else "0"
-    )
     os.environ["FLASH_ATTN_SM90_KV_PAIR"] = kv_pair
     os.environ["FLASH_ATTN_SM90_NUM_STAGES"] = stages
     kernel_kwargs = {
@@ -119,10 +115,10 @@ def main():
         q, k, v, bs = make_inputs(nkv, topk)
         flops = 4 * BLK * BLK * 128 * nkv * topk * 8
         baseline_ms = None
-        for label, min_blocks, dual_tile, kv_pair, stages in [
-            ("1cta", 1, False, "0", "2"),
-            ("2cta", 2, False, "0", "2"),
-            ("optimized", 1, "auto", "auto", "auto"),
+        for label, min_blocks, kv_pair, stages in [
+            ("1cta", 1, "0", "2"),
+            ("2cta", 2, "0", "2"),
+            ("optimized", "auto", "auto", "auto"),
         ]:
             ms = time_kernel(
                 q,
@@ -130,7 +126,6 @@ def main():
                 v,
                 bs,
                 min_blocks,
-                dual_tile,
                 kv_pair,
                 stages,
                 warmup,
